@@ -13,6 +13,11 @@ Sheets:
     Annual          price, dispersion, zero-price hours and spread per year
     Monthly         the same series by month, with a chart
     Hourly profile  mean price per hour and year: the duck curve
+    Cannibalisation what a fleet earns as it grows, if scripts/05_fleet.py has run
+
+The cannibalisation sheet is read from data/processed/fleet.csv rather than
+recomputed here: the fleet simulation is far heavier than these aggregates, and
+tying the two together would make a routine export take minutes.
 """
 
 from __future__ import annotations
@@ -302,6 +307,56 @@ def main() -> None:
     ch.set_categories(Reference(ws, min_col=1, min_row=5, max_row=last))
     label_axes(ch, "Hour of day (local time, 0-23)", "Mean price (€/MWh)")
     ws.add_chart(ch, get_column_letter(len(profile.columns) + 2) + "4")
+
+    # ── Cannibalisation
+    fleet_path = ROOT / config["data"]["processed_dir"] / "fleet.csv"
+    ws = wb.create_sheet("Cannibalisation")
+    ws.sheet_view.showGridLines = False
+    ws["A1"] = "What the fleet earns as the fleet grows"
+    ws["A1"].font = F_TITLE
+
+    if not fleet_path.exists():
+        ws["A3"] = "No data yet. Run scripts/05_fleet.py to produce data/processed/fleet.csv."
+        ws["A3"].font = F_TXT
+        log.warning("No %s: the cannibalisation sheet is empty.", fleet_path.name)
+    else:
+        fleet = pd.read_csv(fleet_path)
+        generated = date.fromtimestamp(fleet_path.stat().st_mtime)
+        ws["A2"] = (
+            "Each row adds storage to the same market and lets the price answer back. Revenue per MW "
+            "falling as the fleet grows is self-cannibalisation; the first row is the price-taker "
+            f"counterfactual. From scripts/05_fleet.py, run on {generated:%d/%m/%Y}."
+        )
+        ws["A2"].font = F_NOTE
+        fleet = pd.DataFrame(
+            {
+                "Fleet (GW)": fleet["fleet_mw"] / 1000.0,
+                "Revenue (€/MW/year)": fleet["revenue_eur_per_mw_year"],
+                "% of price taker": fleet["revenue_vs_price_taker"],
+                "Mean 2 h spread (€/MWh)": fleet["mean_spread_eur_mwh"],
+                "Mean price (€/MWh)": fleet["mean_price_eur_mwh"],
+            }
+        )
+        last = table(
+            ws,
+            4,
+            fleet,
+            {
+                "Fleet (GW)": "#,##0.00",
+                "Revenue (€/MW/year)": "#,##0",
+                "% of price taker": pct,
+                "Mean 2 h spread (€/MWh)": eur,
+                "Mean price (€/MWh)": eur,
+            },
+        )
+        ch = LineChart()
+        ch.title = "Revenue per MW and spread against installed fleet"
+        ch.height, ch.width = 10, 24
+        ch.add_data(Reference(ws, min_col=2, max_col=2, min_row=4, max_row=last), titles_from_data=True)
+        ch.add_data(Reference(ws, min_col=4, max_col=4, min_row=4, max_row=last), titles_from_data=True)
+        ch.set_categories(Reference(ws, min_col=1, min_row=5, max_row=last))
+        label_axes(ch, "Installed fleet (GW)", "€/MW/year  ·  €/MWh")
+        ws.add_chart(ch, "G4")
 
     output = ROOT / "reports" / f"exploratory_analysis{'_demo' if args.demo else ''}.xlsx"
     output.parent.mkdir(parents=True, exist_ok=True)
