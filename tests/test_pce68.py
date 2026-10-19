@@ -257,6 +257,49 @@ def test_curve_reader_finds_columns_by_name_not_position():
     assert parse_curves(shuffled)["price_eur_mwh"].iloc[0] == pytest.approx(0.0)
 
 
+CURVE_HEADER_2025 = (
+    "OMIE - Mercado de electricidad;Fecha Emisión :31/03/2025 - 16:59;;01/04/2025;Mercado diario;;;;\n"
+    "Periodo;Fecha;Pais;Unidad;Tipo Oferta;Potencia Compra/Venta;Precio Compra/Venta;"
+    "Ofertada (O)/Casada (C);Tipología de Oferta;\n"
+)
+
+
+def curve_file_2025(periods: int) -> str:
+    """A file in the layout OMIE switched to on 19/03/2025."""
+    # Numbers in OMIE's own notation: dot for thousands, comma for decimals.
+    rows = [
+        f"{p};01/04/2025;MI;;{kind};{qty};{price};O;S;"
+        for p in range(1, periods + 1)
+        for kind, qty, price in (
+            ("V", "1.000,0", "0,00"),
+            ("V", "500,0", "45,30"),
+            ("C", "2.000,0", "180,00"),
+        )
+    ]
+    return CURVE_HEADER_2025 + "\n".join(rows) + "\n"
+
+
+def test_reader_accepts_the_2025_layout():
+    """Energia was renamed Potencia; the old reader aborted every file from 19/03/2025."""
+    bids = parse_curves(curve_file_2025(periods=24))
+    assert len(bids) == 72
+    assert set(bids["kind"]) == {"C", "V"}
+
+
+def test_tipologia_column_is_not_mistaken_for_tipo_oferta():
+    """The 2025 files added 'Tipología de Oferta'; matching on 'tipo' alone would grab it."""
+    bids = parse_curves(curve_file_2025(periods=1))
+    assert sorted(bids["kind"].unique()) == ["C", "V"], "kind must come from 'Tipo Oferta', not 'S'"
+
+
+def test_power_is_converted_to_energy_on_quarter_hourly_days():
+    """1 MW over a quarter hour is 0.25 MWh. Without this the battery volume is 4x out."""
+    hourly = parse_curves(curve_file_2025(periods=24))
+    quarterly = parse_curves(curve_file_2025(periods=96))
+    assert hourly["energy_mwh"].max() == pytest.approx(2000.0)
+    assert quarterly["energy_mwh"].max() == pytest.approx(500.0)
+
+
 def test_curves_accumulate_in_the_right_direction():
     buy, sell = build_curves(parse_curves(CURVE_FILE), period=1)
     assert sell.at(0.0) == pytest.approx(1000.5)

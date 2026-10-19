@@ -9,9 +9,18 @@ covers -- what is not downloaded now is lost.
     curva_pbc_YYYYMMDD.1
 
 The reader finds its columns by name rather than position, because the layout
-differs between the aggregated files and the monthly curva_pbc_uof ones, and
-because from 01/10/2025 the period field counts quarter hours instead of hours,
-matching the change already handled in `pce68.data.omie`.
+is not stable. Two changes are known, both from real files:
+
+    to 18/03/2025    Hora;...;Tipo Oferta;Energia Compra/Venta;Precio ...
+    from 19/03/2025  Periodo;...;Tipo Oferta;Potencia Compra/Venta;Precio ...;
+                     Tipologia de Oferta;
+
+Besides the renaming, the quantity changed meaning: the newer files declare
+POWER in MW, not energy in MWh. Over an hourly period the two coincide, but
+over a quarter hour 1 MW is 0.25 MWh. Clearing is unaffected, since both curves
+move together, but the battery volume added to a curve is in MWh and would be
+overstated fourfold if it were not converted. `parse` therefore returns MWh
+whatever the file declares.
 
 The exact layout has not been checked against a live file from this project, so
 the first run on real data must be validated: re-clear the untouched historical
@@ -40,10 +49,13 @@ URL = "https://www.omie.es/es/file-download?parents%5B0%5D=curva_pbc&filename=cu
 ENCODING = "latin-1"
 
 # Fields we need, and the fragments that identify them whatever the layout.
+# "tipo oferta" is matched in full so it cannot swallow "tipologia de oferta",
+# the column added in 2025, and "quantity" covers both the old energy column
+# and the power one that replaced it.
 WANTED = {
     "period": ("periodo", "hora"),
-    "kind": ("tipo",),
-    "energy": ("energ",),
+    "kind": ("tipo oferta",),
+    "quantity": ("energ", "potencia"),
     "price": ("precio",),
     "state": ("ofertada", "casada"),
 }
@@ -60,10 +72,10 @@ def _fold(text: str) -> str:
 
 
 def _header_row(lines: list[str]) -> int:
-    """Index of the header line: the first one naming both a price and an energy."""
+    """Index of the header line: the first one naming a price and a quantity."""
     for i, line in enumerate(lines[:20]):
         folded = _fold(line)
-        if "precio" in folded and "energ" in folded:
+        if "precio" in folded and ("energ" in folded or "potencia" in folded):
             return i
     raise ValueError("no header found; check the OMIE file layout")
 
@@ -79,7 +91,7 @@ def _columns(header: list[str]) -> dict[str, int]:
             if name not in found and any(f in folded for f in fragments):
                 found[name] = i
                 break
-    missing = {"period", "kind", "energy", "price"} - found.keys()
+    missing = {"period", "kind", "quantity", "price"} - found.keys()
     if missing:
         raise ValueError(f"OMIE header is missing {sorted(missing)}")
     return found
@@ -99,12 +111,15 @@ def parse(text: str, offered_only: bool = True) -> pd.DataFrame:
     those are the full curve, and the matched subset would clear at itself.
     """
     lines = text.splitlines()
-    columns = _columns(lines[_header_row(lines)].split(";"))
+    start = _header_row(lines)
+    header = lines[start].split(";")
+    columns = _columns(header)
     width = max(columns.values()) + 1
+    declares_power = "potencia" in _fold(header[columns["quantity"]])
 
     rows: list[tuple[int, str, float, float]] = []
     skipped = 0
-    for line in lines[_header_row(lines) + 1 :]:
+    for line in lines[start + 1 :]:
         fields = line.split(";")
         if len(fields) < width:
             skipped += 1
@@ -114,13 +129,13 @@ def parse(text: str, offered_only: bool = True) -> pd.DataFrame:
         try:
             period = int(fields[columns["period"]].strip())
             kind = fields[columns["kind"]].strip().upper()[:1]
-            energy = _number(fields[columns["energy"]])
+            quantity = _number(fields[columns["quantity"]])
             price = _number(fields[columns["price"]])
         except (ValueError, IndexError):
             skipped += 1
             continue
-        if kind in ("C", "V") and np.isfinite(energy) and np.isfinite(price):
-            rows.append((period, kind, energy, price))
+        if kind in ("C", "V") and np.isfinite(quantity) and np.isfinite(price):
+            rows.append((period, kind, quantity, price))
         else:
             skipped += 1
 
@@ -128,7 +143,14 @@ def parse(text: str, offered_only: bool = True) -> pd.DataFrame:
         log.debug("%d lines skipped", skipped)
     if not rows:
         raise ValueError("curva_pbc file without usable bids")
-    return pd.DataFrame(rows, columns=["period", "kind", "energy_mwh", "price_eur_mwh"])
+    bids = pd.DataFrame(rows, columns=["period", "kind", "energy_mwh", "price_eur_mwh"])
+
+    if declares_power:
+        # MW over a period of this length is MWh. Quarter-hourly days hold 92,
+        # 96 or 100 periods; hourly ones 23, 24 or 25.
+        hours = 0.25 if bids["period"].nunique() > 50 else 1.0
+        bids["energy_mwh"] *= hours
+    return bids
 
 
 def build(bids: pd.DataFrame, period: int) -> tuple[Curve, Curve]:
