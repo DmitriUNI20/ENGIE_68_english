@@ -1,0 +1,16 @@
+# Project parameters. Whatever the scripts read comes from here, not from the code.
+
+data:
+  raw_dir: data/raw/omie          # marginalpdbc_YYYYMMDD.1 files exactly as OMIE serves them
+  processed_dir: data/processed   # omie_prices.parquet
+  start: 2021-01-01
+  end: null                       # null = up to yesterday
+
+battery:
+  # 2 h, like the batteries currently being connected in Spain.
+  duration_hours: 2
+  # Round trip (charge + discharge), AC side. 0.85 is a typical value for LFP
+  # including auxiliaries; ASSUMPTION, replace with the manufacturer's figure if available.
+  round_trip_efficiency: 0.85
+  # Usual warranties: ~1 cycle/day. ASSUMPTION.
+  max_cycles_per_year: 365
