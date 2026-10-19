@@ -5,9 +5,13 @@ import pandas as pd
 import pytest
 
 from pce68.data.omie import parse
-from pce68.dispatch.battery import Battery, optimal_cycle, simulate_price_taker
+from pce68.data.omie_curves import build as build_curves
+from pce68.data.omie_curves import parse as parse_curves
+from pce68.dispatch.battery import Battery, optimal_cycle, optimal_cycle_schedule, simulate_price_taker
+from pce68.dispatch.fleet import LinearImpact, cannibalisation_curve, simulate_fleet
 from pce68.features.metrics import daily_spread
 from pce68.features.regimes import annotate, summary
+from pce68.market.curves import Curve, clear, impact_curve, price_impact
 
 TZ = "Europe/Madrid"
 
@@ -160,3 +164,154 @@ def test_download_falls_back_to_yearly_zip(tmp_path, monkeypatch):
     assert sorted(f.name for f in tmp_path.iterdir()) == [omie.file_name(d) for d in days]
     assert sum(u.endswith(".zip") for u in requested) == 1  # the zip is requested only once
     assert len(omie.consolidate(tmp_path)) == 48
+
+
+# ── Aggregated curves
+
+
+def ladder() -> tuple[Curve, Curve]:
+    """Toy pair whose intersection can be checked by hand.
+
+    Sell:  10 MWh at 20 EUR, 20 at 50, 30 at 90.
+    Buy:   25 MWh at 20 EUR, 18 at 50,  5 at 90.
+    Excess supply is -15 at 20, +2 at 50 and +25 at 90, so it clears at 50.
+    """
+    sell = Curve(np.array([20.0, 50.0, 90.0]), np.array([10.0, 20.0, 30.0]), "sell")
+    buy = Curve(np.array([20.0, 50.0, 90.0]), np.array([25.0, 18.0, 5.0]), "buy")
+    return buy, sell
+
+
+def merit_order(scarcity: float = 1.0) -> tuple[Curve, Curve]:
+    """A convex merit order: cheap steps packed together, dear ones far apart."""
+    t = np.linspace(0.0, 1.0, 40)
+    price = np.concatenate([[-5.0, 0.0], 30.0 + 160.0 * t**2])
+    volume = np.cumsum(np.concatenate([[3000.0, 7000.0], np.full(40, 500.0)]))
+    sell = Curve(price, volume, "sell")
+    buy = Curve(np.array([60.0, 3000.0]), np.array([16000.0 * scarcity, 15000.0 * scarcity]), "buy")
+    return buy, sell
+
+
+def test_curve_steps_in_the_right_direction():
+    buy, sell = ladder()
+    assert sell.at(10.0) == 0.0 and sell.at(20.0) == 10.0 and sell.at(49.9) == 10.0
+    assert buy.at(20.0) == 25.0 and buy.at(21.0) == 18.0 and buy.at(1000.0) == 0.0
+
+
+def test_clearing_on_a_hand_checked_case():
+    assert clear(*ladder()) == (50.0, 18.0)
+
+
+def test_demand_above_supply_clears_at_the_cap():
+    sell = Curve(np.array([10.0]), np.array([5.0]), "sell")
+    buy = Curve(np.array([10.0]), np.array([100.0]), "buy")
+    assert clear(buy, sell)[0] == 4000.0
+
+
+def test_charging_lifts_the_price_and_discharging_depresses_it():
+    buy, sell = merit_order()
+    assert price_impact(buy, sell, 1000.0, "charge") >= 0.0
+    assert price_impact(buy, sell, 1000.0, "discharge") <= 0.0
+    assert price_impact(buy, sell, 0.0, "discharge") == 0.0
+
+
+def test_discharging_more_never_raises_the_price():
+    buy, sell = merit_order()
+    impacts = impact_curve(buy, sell, np.array([0.0, 500.0, 1000.0, 2000.0, 4000.0]), "discharge")
+    assert np.all(np.diff(impacts) <= 1e-9)
+
+
+def test_price_impact_is_not_proportional_to_volume():
+    """The reason a single slope cannot stand in for the curves."""
+    buy, sell = merit_order()
+    small, large = impact_curve(buy, sell, np.array([1000.0, 4000.0]), "discharge")
+    assert not np.isclose(large / small, 4.0, rtol=0.05)
+
+
+def test_shift_refuses_a_negative_volume():
+    with pytest.raises(ValueError):
+        ladder()[1].shift(-1.0)
+
+
+CURVE_FILE = (
+    "OMIE - Mercado de electricidad;Curvas agregadas;15/01/2024;\n"
+    "Hora;Fecha;Tipo Oferta;Energía Compra/Venta;Precio Compra/Venta;Ofertada (O)/Casada (C);\n"
+    "1;15/01/2024;V;1.000,5;0,00;O;\n"
+    "1;15/01/2024;V;500,0;45,30;O;\n"
+    "1;15/01/2024;C;2.000,0;180,00;O;\n"
+    "1;15/01/2024;C;300,0;20,00;O;\n"
+    "1;15/01/2024;V;900,0;45,30;C;\n"
+)
+
+
+def test_curve_reader_drops_matched_rows_and_reads_comma_decimals():
+    bids = parse_curves(CURVE_FILE)
+    assert len(bids) == 4  # the row flagged as matched is not part of the offered curve
+    assert bids["energy_mwh"].max() == pytest.approx(2000.0)
+
+
+def test_curve_reader_finds_columns_by_name_not_position():
+    shuffled = CURVE_FILE.replace(
+        "Hora;Fecha;Tipo Oferta;Energía Compra/Venta;Precio Compra/Venta;Ofertada (O)/Casada (C);",
+        "Precio Compra/Venta;Hora;Fecha;Tipo Oferta;Energía Compra/Venta;Ofertada (O)/Casada (C);",
+    ).replace("1;15/01/2024;V;1.000,5;0,00;O;", "0,00;1;15/01/2024;V;1.000,5;O;")
+    assert parse_curves(shuffled)["price_eur_mwh"].iloc[0] == pytest.approx(0.0)
+
+
+def test_curves_accumulate_in_the_right_direction():
+    buy, sell = build_curves(parse_curves(CURVE_FILE), period=1)
+    assert sell.at(0.0) == pytest.approx(1000.5)
+    assert sell.at(45.30) == pytest.approx(1500.5)
+    assert buy.at(180.0) == pytest.approx(2000.0)
+    assert buy.at(20.0) == pytest.approx(2300.0)
+
+
+# ── Fleet
+
+
+def duck(day: str, n_days: int = 4) -> pd.DataFrame:
+    """A few days with a solar trough and an evening peak, the shape arbitrage lives on."""
+    shape = np.array([60, 55, 50, 48, 48, 55, 70, 85, 70, 40, 20, 10, 5, 10, 25, 45, 75, 110, 140, 150,
+                      145, 120, 95, 75], dtype=float)
+    frames = [series(f"{day[:-2]}{int(day[-2:]) + i:02d}", (shape + i).tolist()) for i in range(n_days)]
+    return pd.concat(frames, ignore_index=True)
+
+
+def test_fleet_without_feedback_matches_the_price_taker():
+    """The new machinery must be a strict generalisation of the tested engine."""
+    prices, bat = duck("2024-05-01"), Battery(2, 0.85, 365)
+    fleet = simulate_fleet(prices, bat, LinearImpact(0.0), fleet_mw=1.0).daily
+    taker = simulate_price_taker(prices, bat)
+    assert fleet["revenue_eur_per_mw"].to_numpy() == pytest.approx(taker["revenue_eur_per_mw"].to_numpy())
+    assert fleet["cycles"].tolist() == taker["cycles"].tolist()
+
+
+def test_schedule_agrees_with_the_margin_it_replaces():
+    rng = np.random.default_rng(0)
+    bat = Battery(2, 0.85, 365)
+    for _ in range(20):
+        p = rng.normal(80.0, 40.0, 24)
+        h = np.ones(24)
+        charge, discharge, margin = optimal_cycle_schedule(p, h, bat)
+        assert margin == pytest.approx(optimal_cycle(p, h, bat))
+        if margin > 0:
+            assert (p * discharge).sum() - (p * charge).sum() == pytest.approx(margin)
+            assert discharge.sum() == pytest.approx(bat.duration_hours)
+
+
+def test_revenue_per_mw_falls_as_the_fleet_grows():
+    """Self-cannibalisation: the feedback is what makes it appear at all."""
+    prices, bat = duck("2024-05-01"), Battery(2, 0.85, 365)
+    table = cannibalisation_curve(
+        prices, bat, LinearImpact(8.0), fleet_sizes_mw=[500.0, 2000.0, 6000.0], tranche_mw=250.0
+    )
+    revenue = table["revenue_eur_per_mw_year"].to_numpy()
+    assert np.all(np.diff(revenue) < 0), "every extra GW must cut what the fleet already there earns"
+    assert table["mean_spread_eur_mwh"].is_monotonic_decreasing
+    assert table["revenue_vs_price_taker"].iloc[0] == pytest.approx(1.0)
+
+
+def test_a_fleet_large_enough_stops_entering():
+    """Once the spread is arbitraged away no further tranche would be built."""
+    prices, bat = duck("2024-05-01"), Battery(2, 0.85, 365)
+    result = simulate_fleet(prices, bat, LinearImpact(60.0), fleet_mw=40000.0, tranche_mw=250.0)
+    assert result.daily["discharged_mwh"].max() < 40000.0 * bat.duration_hours

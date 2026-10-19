@@ -14,3 +14,19 @@ battery:
   round_trip_efficiency: 0.85
   # Usual warranties: ~1 cycle/day. ASSUMPTION.
   max_cycles_per_year: 365
+
+fleet:
+  # Sizes to simulate, in MW. The last one is the order of the 2030 NECP target.
+  sizes_mw: [500, 1000, 2000, 4000, 8000, 12000, 17000]
+  # Each tranche enters against the prices left by the ones before it. 250 MW at
+  # 2 h matches the 0.25 GWh agents of Gottfried and Muller (2026).
+  tranche_mw: 250
+  # Aggregated OMIE curves. Public with ~90 days' delay, rolling six years of
+  # archive: what is not downloaded now is lost.
+  curves_dir: data/raw/omie_curves
+  # PROVISIONAL, used only while curves_dir is empty. A single slope cannot
+  # describe a merit order that steepens as it is climbed, so it is a
+  # placeholder for exercising the machinery, never a source of reportable
+  # numbers. For scale: Germany averaged 15.34 EUR/MWh per GWh in 2024, but as
+  # an outcome of the curves, not as an input.
+  linear_slope_eur_mwh_per_gwh: 8.0
