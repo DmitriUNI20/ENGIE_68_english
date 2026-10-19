@@ -15,7 +15,7 @@ day-ahead market clears in quarter hours: 96 periods (92 or 100).
 UTC time is computed by adding durations to local midnight, which is never
 ambiguous, so daylight-saving changes come out right without special handling.
 """
-
+#test
 from __future__ import annotations
 
 import io
