@@ -167,6 +167,56 @@ def main() -> None:
     if best:
         print(f"\n  Best: country={best[1]} state={best[2]} with a mean error of {best[0]:.3f} EUR/MWh")
         print("  Anything under ~0.5 is the right combination; the reference reports 0.05.")
+        print("  CAUTION: state=C (matched) reproduces the price by construction and carries no")
+        print("  information beyond the clearing point, which is the region the method explores.")
+
+    # ── Which side is short, at the price OMIE actually published
+    print("\nBalance at the published price (volumes in MWh)")
+    print(
+        f"  {'period':>6}  {'state':>6}  {'n buy':>7}  {'n sell':>7}  {'buy tot':>10}  {'sell tot':>10}"
+        f"  {'buy@pub':>10}  {'sell@pub':>10}  {'sell-buy':>10}"
+    )
+    for period in PERIODS_SHOWN:
+        if period not in real:
+            continue
+        p_pub = real[period]
+        for state in states + ["(all)"]:
+            picked = [
+                (r[c_kind].strip(), number(r[c_qty]), number(r[c_price]))
+                for r in rows
+                if int(r[c_period]) == period
+                and (state == "(all)" or c_state is None or r[c_state].strip() == state)
+            ]
+            buy = [(p, q) for k, q, p in picked if k == "C"]
+            sell = [(p, q) for k, q, p in picked if k == "V"]
+            buy_at = sum(q for p, q in buy if p >= p_pub)
+            sell_at = sum(q for p, q in sell if p <= p_pub)
+            print(
+                f"  {period:>6}  {str(state):>6}  {len(buy):>7}  {len(sell):>7}"
+                f"  {sum(q for _, q in buy):>10,.0f}  {sum(q for _, q in sell):>10,.0f}"
+                f"  {buy_at:>10,.0f}  {sell_at:>10,.0f}  {sell_at - buy_at:>10,.0f}"
+            )
+    print("\n  On the true offered curve the last two columns should match at the published price,")
+    print("  so 'sell-buy' near zero identifies the curve the method needs. A large positive")
+    print("  number means surplus supply, which is what drags the clearing price down.")
+
+    # ── Are the matched rows a copy of the offered ones, or different bids?
+    period = PERIODS_SHOWN[0]
+    def triples(state: str) -> set[tuple[str, float, float]]:
+        return {
+            (r[c_kind].strip(), number(r[c_qty]), number(r[c_price]))
+            for r in rows
+            if int(r[c_period]) == period and c_state is not None and r[c_state].strip() == state
+        }
+
+    if c_state is not None and {"O", "C"} <= set(values(c_state)):
+        offered, matched = triples("O"), triples("C")
+        print(f"\nOverlap of the two sets in period {period}")
+        print(f"  distinct offered rows  {len(offered)}")
+        print(f"  distinct matched rows  {len(matched)}")
+        print(f"  identical in both      {len(offered & matched)}")
+        print("  Many identical rows mean the file lists each bid twice and the two sets must not")
+        print("  be added together; few mean the matched rows are partial fills of the offered ones.")
 
 
 if __name__ == "__main__":
