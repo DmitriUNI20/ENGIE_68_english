@@ -13,6 +13,7 @@ the combination that reproduces marginalpdbc identifies itself.
 
 from __future__ import annotations
 
+import collections
 import itertools
 import sys
 import unicodedata
@@ -217,6 +218,64 @@ def main() -> None:
         print(f"  identical in both      {len(offered & matched)}")
         print("  Many identical rows mean the file lists each bid twice and the two sets must not")
         print("  be added together; few mean the matched rows are partial fills of the offered ones.")
+
+    # ── Hypothesis: the surplus supply is bids rejected by their complex conditions
+    #
+    # MIBEL generators bid with conditions (minimum income, indivisibility, load
+    # gradient). EUPHEMIA rejects bids that are in the money on price but fail
+    # their condition, so a plain intersection of the offered curves cannot
+    # reproduce the price. Because every matched row is a copy of an offered one,
+    # the rejected bids can be named: supply offered at or below the published
+    # price with no matched counterpart. Dropping those and keeping everything
+    # else leaves a curve that should both reproduce the price AND still extend
+    # beyond the clearing point, which is the region the battery shift explores.
+    if c_state is None or not {"O", "C"} <= set(values(c_state)):
+        return
+
+    print("\nDropping in-the-money supply that was never matched")
+    print(f"  {'period':>6}  {'published':>10}  {'offered':>10}  {'corrected':>10}  {'dropped MWh':>12}")
+    errors_raw, errors_fixed = [], []
+    for period in sorted({int(r[c_period]) for r in rows}):
+        if period not in real:
+            continue
+        p_pub = real[period]
+        here = [r for r in rows if int(r[c_period]) == period]
+        offered = [
+            (r[c_kind].strip(), number(r[c_qty]), number(r[c_price]))
+            for r in here
+            if r[c_state].strip() == "O"
+        ]
+        left = collections.Counter(
+            (r[c_kind].strip(), number(r[c_qty]), number(r[c_price]))
+            for r in here
+            if r[c_state].strip() == "C"
+        )
+        kept, dropped = [], 0.0
+        for t in offered:
+            kind, qty, price = t
+            if kind == "V" and price <= p_pub:
+                if left[t] > 0:
+                    left[t] -= 1
+                    kept.append(t)
+                else:
+                    dropped += qty
+            else:
+                kept.append(t)
+
+        raw = clear(offered)
+        fixed = clear(kept)
+        errors_raw.append(abs(raw - p_pub))
+        errors_fixed.append(abs(fixed - p_pub))
+        if period in PERIODS_SHOWN:
+            print(f"  {period:>6}  {p_pub:>10.2f}  {raw:>10.2f}  {fixed:>10.2f}  {dropped:>12,.0f}")
+
+    print(f"\n  mean |error|, offered curve as published   {np.mean(errors_raw):>8.3f} EUR/MWh")
+    print(f"  mean |error|, rejected bids removed        {np.mean(errors_fixed):>8.3f} EUR/MWh")
+    print("\n  If the second number is near zero, the surplus really is complex-condition")
+    print("  rejections and the curve can be corrected. The correction uses the observed")
+    print("  clearing price to identify which bids failed, so it calibrates the market's")
+    print("  rejection pattern; it cannot know that a higher price would have satisfied")
+    print("  some of those conditions, which stays a limitation to declare.")
 
 
 if __name__ == "__main__":
