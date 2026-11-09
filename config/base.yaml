@@ -62,6 +62,13 @@ projection:
   # TEST forecast is used instead: the last 52 weeks of real prices repeated
   # for each of `test_years`.
   forecast_file: data/external/engie_forecast.csv
+  # Without ENGIE's file: a public baseline from OMIP futures (omip.pt), the
+  # Iberian forward market. Put here the price (EUR/MWh) of the Spanish BASELOAD
+  # future of each calendar year (YR-27, YR-28 ...) and the date you read them.
+  # The last 52 weeks of real prices are rescaled to average each year's future.
+  # Empty: the TEST forecast below is used instead.
+  omip_futures_date: null      # e.g. 2026-11-09
+  omip_futures: {}             # e.g. {2027: 00.00, 2028: 00.00, 2029: 00.00, 2030: 00.00}
   test_years: [2027, 2028, 2029, 2030]
   # Installed battery storage in Spain (GW) by scenario: year (1 January) or
   # date -> GW, linear in between. ILLUSTRATIVE paths: replace them with ENGIE's.

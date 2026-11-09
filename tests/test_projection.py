@@ -56,3 +56,17 @@ def test_test_forecast_repeats_the_last_52_weeks_by_weekday():
     assert f["price"].notna().all() and len(f) == 4 * 24 * (365 + 366) - 0  # DST: 23 h and 25 h days cancel
     weekday = f["timestamp_utc"].dt.tz_convert("Europe/Madrid").dt.weekday
     assert (f["price"] == weekday).mean() > 0.999
+
+
+def test_futures_forecast_keeps_the_shape_and_averages_each_future():
+    from pce68.model.projection import futures_forecast
+
+    ts = pd.date_range("2025-11-01", "2026-11-01", freq="15min", tz="Europe/Madrid", inclusive="left")
+    shape = 50 + 30 * np.sin(np.arange(len(ts)) / 96 * 2 * np.pi)
+    prices = pd.DataFrame({"timestamp_utc": ts.tz_convert("UTC"), "price_es": shape})
+    f = futures_forecast(prices, None, {2027: 60.0, 2028: 75.0})
+    year = f["timestamp_utc"].dt.tz_convert("Europe/Madrid").dt.year
+    assert np.allclose(f.groupby(year)["price"].mean(), [60.0, 75.0])
+    base = make_test_forecast(prices, None, [2027, 2028])
+    ratio = f["price"] / base["price"]
+    assert np.allclose(ratio[year == 2027], ratio[year == 2027].iloc[0])  # one factor per year: same shape
