@@ -20,6 +20,16 @@ residual demand, renewable share). No day identifier, as the roadmap asks.
 
 Validation leaves one calendar month out at a time: the model is scored on a
 month it has not seen, so seasonal effects cannot leak from training to test.
+
+Two refinements aim at the fleet's revenue, which is what the cannibalisation
+curve needs:
+
+* weights: periods where the fleet charges or discharges weigh more in the
+  fit, as only they enter its revenue;
+* calibration by fleet size: regression shrinks the largest impacts towards
+  the mean, so the fitted prices are too kind to storage. For each fleet size
+  a factor rescales the predicted delta so that the revenue of the simulated
+  dispatch matches on the training months.
 """
 
 from __future__ import annotations
@@ -44,11 +54,20 @@ BASE_FEATURES = [
     "p0_rank",
     "day_mean",
     "day_spread",
+    "day_top_2h",
+    "day_bottom_2h",
 ]
 FUNDAMENTALS = ["demand", "wind", "solar_pv", "residual_demand", "renewable_share"]
 
 
-def build_dataset(panel: pd.DataFrame, fundamentals: pd.DataFrame | None) -> pd.DataFrame:
+def _mean_of_extremes(prices: pd.Series, hours: pd.Series, duration: float, top: bool) -> float:
+    n = max(1, round(duration / hours.iloc[0]))
+    return float((prices.nlargest(n) if top else prices.nsmallest(n)).mean())
+
+
+def build_dataset(
+    panel: pd.DataFrame, fundamentals: pd.DataFrame | None, duration_hours: float = 2.0
+) -> pd.DataFrame:
     """One row per (day, period, X > 0) with features and the target `delta`.
 
     Periods where Spain and Portugal cleared apart are dropped (the Iberian
@@ -76,6 +95,20 @@ def build_dataset(panel: pd.DataFrame, fundamentals: pd.DataFrame | None) -> pd.
     d["p0_rank"] = by_day.rank(pct=True)
     d["day_mean"] = by_day.transform("mean")
     d["day_spread"] = by_day.transform("max") - by_day.transform("min")
+    # Mean price of the dearest and cheapest `duration_hours` of the day: where the fleet trades.
+    keys = ["day", "bess_gw"]
+    for name, top in (("day_top_2h", True), ("day_bottom_2h", False)):
+        per_day = d.groupby(keys)[["p0", "hours"]].apply(
+            lambda g, top=top: _mean_of_extremes(g["p0"], g["hours"], duration_hours, top)
+        )
+        d[name] = d.set_index(keys).index.map(per_day).to_numpy()
+
+    # Weight in the fit: 1, plus up to 4 more for the share of the fleet's power traded.
+    if {"charge_mw", "discharge_mw"} <= set(d.columns):
+        traded = (d["discharge_mw"] - d["charge_mw"]).abs() / (d["bess_gw"] * 1000)
+        d["weight"] = 1 + 4 * traded.clip(upper=1)
+    else:
+        d["weight"] = 1.0
 
     if fundamentals is not None:
         f = fundamentals.copy()
@@ -106,8 +139,8 @@ class RidgeWithStorage:
         other = x.drop(columns="bess_gw").to_numpy()
         return np.hstack([other * gw, other * gw**2, gw, gw**2])
 
-    def fit(self, x: pd.DataFrame, y: np.ndarray) -> RidgeWithStorage:
-        self.model.fit(self._design(x), y)
+    def fit(self, x: pd.DataFrame, y: np.ndarray, sample_weight=None) -> RidgeWithStorage:
+        self.model.fit(self._design(x), y, ridge__sample_weight=sample_weight)
         return self
 
     def predict(self, x: pd.DataFrame) -> np.ndarray:
@@ -117,7 +150,7 @@ class RidgeWithStorage:
 class RankLookup:
     """Benchmark: mean delta by decile of the price's rank within the day and by X."""
 
-    def fit(self, x: pd.DataFrame, y: np.ndarray) -> RankLookup:
+    def fit(self, x: pd.DataFrame, y: np.ndarray, sample_weight=None) -> RankLookup:
         key = pd.DataFrame({"decile": (x["p0_rank"] * 10).clip(upper=9.999).astype(int), "gw": x["bess_gw"]})
         self.table = pd.Series(y, index=pd.MultiIndex.from_frame(key)).groupby(level=[0, 1]).mean()
         return self
@@ -127,96 +160,130 @@ class RankLookup:
         return self.table.reindex(key).fillna(0.0).to_numpy()
 
 
+def _boosting() -> HistGradientBoostingRegressor:
+    return HistGradientBoostingRegressor(max_iter=300, learning_rate=0.1, random_state=0)
+
+
 def models() -> dict[str, object]:
     return {
         "rank lookup": RankLookup(),
         "ridge": RidgeWithStorage(alpha=1.0),
-        "gradient boosting": HistGradientBoostingRegressor(max_iter=300, learning_rate=0.1, random_state=0),
+        "gradient boosting": _boosting(),
+        "gradient boosting, weighted": _boosting(),
     }
 
 
-def cross_validate(data: pd.DataFrame, features: list[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Leave-one-month-out scores for each model, plus the no-impact benchmark.
+WEIGHTED = {"gradient boosting, weighted"}
+CALIBRATED = ["gradient boosting", "gradient boosting, weighted"]
 
-    MAE is of the price the model predicts (p0 + predicted delta) against the
-    simulated p^X, in €/MWh, overall and in the cheapest and dearest decile of
-    each day, where storage charges and discharges.
 
-    Also returns the out-of-month predictions: the rows used, with one column
-    `pred_<model>` of predicted delta per model, for the checks below.
+def fit_model(name: str, data: pd.DataFrame, features: list[str]):
+    model = models()[name]
+    weight = data["weight"].to_numpy() if name in WEIGHTED else None
+    return model.fit(data[features], data["delta"].to_numpy(), sample_weight=weight)
+
+
+def _traded_energy(d: pd.DataFrame) -> pd.Series:
+    return (d["discharge_mw"] - d["charge_mw"]) * d["hours"]
+
+
+def size_factors(d: pd.DataFrame, pred: pd.Series) -> pd.Series:
+    """Per fleet size, the factor on predicted delta that makes the dispatch's revenue match.
+
+    Revenue = sum(energy * (p0 + delta)), so matching it means
+    sum(energy * delta) = a * sum(energy * predicted delta).
+    """
+    e = _traded_energy(d)
+    num = (e * d["delta"]).groupby(d["bess_gw"]).sum()
+    den = (e * pred).groupby(d["bess_gw"]).sum()
+    return (num / den).where(den.abs() > 0, 1.0)
+
+
+def cross_validate(data: pd.DataFrame, features: list[str]) -> pd.DataFrame:
+    """Leave-one-month-out predictions of delta for each model and the no-impact benchmark.
+
+    Returns the rows used, with one column `pred_<model>` of predicted delta
+    per model, all made on months the model did not see. The calibrated
+    variants get their factors from the other months' predictions: the
+    test month never sets its own factor.
     """
     data = data.dropna(subset=[*features, "delta"])
-    rows, predicted = [], []
+    predicted = []
     for month in sorted(data["month_key"].unique()):
         train, test = data[data["month_key"] != month], data[data["month_key"] == month]
         preds = {"no impact": np.zeros(len(test))}
-        for name, model in models().items():
-            model.fit(train[features], train["delta"].to_numpy())
-            preds[name] = model.predict(test[features])
+        for name in models():
+            preds[name] = fit_model(name, train, features).predict(test[features])
         predicted.append(test.assign(**{f"pred_{name}": p for name, p in preds.items()}))
-        for name, p in preds.items():
-            err = np.abs(p - test["delta"].to_numpy())
-            rows.append(
-                {
-                    "month": month,
-                    "model": name,
-                    "n": len(test),
-                    "abs_err_sum": err.sum(),
-                    "low_err_sum": err[test["p0_rank"].to_numpy() <= 0.1].sum(),
-                    "low_n": int((test["p0_rank"] <= 0.1).sum()),
-                    "high_err_sum": err[test["p0_rank"].to_numpy() > 0.9].sum(),
-                    "high_n": int((test["p0_rank"] > 0.9).sum()),
-                    "sq_err_sum": ((p - test["delta"].to_numpy()) ** 2).sum(),
-                    "sq_tot_sum": ((test["delta"] - test["delta"].mean()) ** 2).sum(),
-                }
-            )
-    return pd.DataFrame(rows), pd.concat(predicted)
+    out = pd.concat(predicted)
+    if {"charge_mw", "discharge_mw"} <= set(out.columns):
+        for name in CALIBRATED:
+            col = out[f"pred_{name}"]
+            calibrated = pd.Series(np.nan, index=out.index)
+            for month in out["month_key"].unique():
+                other = out["month_key"] != month
+                factors = size_factors(out[other], col[other])
+                rows = ~other
+                calibrated[rows] = col[rows] * out.loc[rows, "bess_gw"].map(factors).fillna(1.0)
+            out[f"pred_{name} + calibrated"] = calibrated
+    return out
 
 
-def summarise(scores: pd.DataFrame) -> pd.DataFrame:
-    g = scores.groupby("model").sum(numeric_only=True)
-    out = pd.DataFrame(
-        {
-            "MAE (€/MWh)": g["abs_err_sum"] / g["n"],
-            "MAE cheapest 10%": g["low_err_sum"] / g["low_n"],
-            "MAE dearest 10%": g["high_err_sum"] / g["high_n"],
-            "R²": 1 - g["sq_err_sum"] / g["sq_tot_sum"],
+def model_names(predicted: pd.DataFrame) -> list[str]:
+    return [c.removeprefix("pred_") for c in predicted.columns if c.startswith("pred_")]
+
+
+def summarise(predicted: pd.DataFrame) -> pd.DataFrame:
+    """MAE of the predicted price with storage (€/MWh), overall and in each day's cheapest and
+    dearest 10 %, and R² (against each month's own mean), from out-of-month predictions."""
+    delta = predicted["delta"]
+    low, high = predicted["p0_rank"] <= 0.1, predicted["p0_rank"] > 0.9
+    tot = ((delta - delta.groupby(predicted["month_key"]).transform("mean")) ** 2).sum()
+    rows = {}
+    for name in model_names(predicted):
+        err = predicted[f"pred_{name}"] - delta
+        rows[name] = {
+            "MAE (€/MWh)": err.abs().mean(),
+            "MAE cheapest 10%": err[low].abs().mean(),
+            "MAE dearest 10%": err[high].abs().mean(),
+            "R²": 1 - (err**2).sum() / tot,
         }
-    )
-    return out.sort_values("MAE (€/MWh)")
+    return pd.DataFrame(rows).T.rename_axis("model").sort_values("MAE (€/MWh)")
 
 
 def error_by_fleet_size(predicted: pd.DataFrame) -> pd.DataFrame:
     """MAE (€/MWh) of each model for each fleet size, on unseen months: one column per model."""
-    names = [c.removeprefix("pred_") for c in predicted.columns if c.startswith("pred_")]
     err = pd.DataFrame(
-        {n: (predicted[f"pred_{n}"] - predicted["delta"]).abs() for n in names}, index=predicted.index
+        {n: (predicted[f"pred_{n}"] - predicted["delta"]).abs() for n in model_names(predicted)},
+        index=predicted.index,
     )
     return err.groupby(predicted["bess_gw"]).mean().rename_axis("GW")
 
 
-def revenue_check(predicted: pd.DataFrame, model: str) -> pd.DataFrame:
-    """Fleet revenue per MW and year from the simulated prices and from the model's, by fleet size.
-
-    Both use the simulated dispatch of the fleet, so the difference is only the
-    error of the predicted prices, weighted by the energy traded in each
-    period: what matters for the cannibalisation curve. "No impact" prices the
-    same dispatch at the original prices, i.e. ignoring cannibalisation.
-    Rows are those of the validation (Spain-Portugal splits are left out), so
-    the simulated column can differ slightly from fleet.csv.
-    """
-    energy = (predicted["discharge_mw"] - predicted["charge_mw"]) * predicted["hours"]
+def revenue_by_model(predicted: pd.DataFrame) -> pd.DataFrame:
+    """Fleet revenue per MW and year (EUR) by fleet size: the simulated dispatch priced at the
+    simulated prices and at each model's. "no impact" prices it at the original prices, i.e.
+    ignoring cannibalisation. Spain-Portugal splits are left out, so the simulated column can
+    differ slightly from fleet.csv."""
+    energy = _traded_energy(predicted)
     revenue = pd.DataFrame(
-        {
-            "simulated": energy * predicted["p_x"],
-            "model": energy * (predicted["p0"] + predicted[f"pred_{model}"]),
-            "no impact": energy * predicted["p0"],
-        }
+        {"simulated": energy * predicted["p_x"]}
+        | {n: energy * (predicted["p0"] + predicted[f"pred_{n}"]) for n in model_names(predicted)}
     )
-    gw = predicted["bess_gw"]
-    table = revenue.groupby(gw).sum()
+    table = revenue.groupby(predicted["bess_gw"]).sum()
     days = predicted["day"].nunique()
-    table = table.div(table.index.to_series() * 1000, axis=0) * 365 / days
-    table["model error %"] = 100 * (table["model"] / table["simulated"] - 1)
-    table["no impact error %"] = 100 * (table["no impact"] / table["simulated"] - 1)
-    return table.rename_axis("GW")
+    return (table.div(table.index.to_series() * 1000, axis=0) * 365 / days).rename_axis("GW")
+
+
+def revenue_errors(revenue: pd.DataFrame) -> pd.DataFrame:
+    """Error (%) of each model's revenue against the simulated one, by fleet size."""
+    return 100 * (revenue.drop(columns="simulated").div(revenue["simulated"], axis=0) - 1)
+
+
+def predict_delta(bundle: dict, x: pd.DataFrame) -> np.ndarray:
+    """Predicted delta from a saved bundle (model, features, optional size factors)."""
+    pred = bundle["model"].predict(x[bundle["features"]])
+    factors = bundle.get("factors")
+    if factors is not None:
+        pred = pred * x["bess_gw"].map(factors).fillna(1.0).to_numpy()
+    return pred

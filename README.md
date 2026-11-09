@@ -41,7 +41,7 @@ Step by step:
 | `src/pce68/dispatch/battery.py` | Arbitrage of 1 MW of battery, price taker, one cycle per day. |
 | `src/pce68/market/curves.py` | Clearing price of a period's curves and calibration to the historical price. |
 | `src/pce68/dispatch/fleet.py` | Dispatch of a fleet of X GW that moves the prices it trades at, up to the competitive equilibrium. |
-| `src/pce68/model/impact_model.py` | Stage 2: dataset, models (lookup, ridge, gradient boosting) and leave-one-month-out validation of the price impact, error by fleet size and revenue check. |
+| `src/pce68/model/impact_model.py` | Stage 2: dataset, models (lookup, ridge, gradient boosting) and leave-one-month-out validation of the price impact; weighted and size-calibrated variants; error by fleet size and revenue check. |
 | `src/pce68/market/impact.py` | Prices of each day with X GW of storage, and the impact y = pX / p0. |
 
 The assumptions behind each calculation are documented at the top of its module.
