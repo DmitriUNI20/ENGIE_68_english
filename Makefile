@@ -1,4 +1,4 @@
-.PHONY: all data curves impact excel excel-demo fleet plot fundamentals test lint
+.PHONY: all data curves impact excel excel-demo fleet plot fundamentals model test lint
 
 all:
 	uv run python scripts/run_all.py
@@ -26,6 +26,9 @@ plot:
 
 fundamentals:
 	uv run python scripts/07_download_fundamentals.py
+
+model:
+	uv run python scripts/08_fit_impact_model.py
 
 test:
 	uv run pytest -q
