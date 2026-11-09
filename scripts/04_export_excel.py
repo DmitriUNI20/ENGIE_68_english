@@ -16,6 +16,9 @@ Sheets:
     Cannibalisation revenue per MW and spread against GW of storage, from
                     05_fleet.py (only if data/processed/fleet.csv exists:
                     run 03_simulate_impact.py and 05_fleet.py before this)
+    Impact model    stage 2: how well the statistical model reproduces the
+                    simulator on months it did not see, and the revenue curve
+                    from its prices (only if 08_fit_impact_model.py has run)
 """
 
 from __future__ import annotations
@@ -176,6 +179,103 @@ def add_cannibalisation_sheet(wb: Workbook, fleet: pd.DataFrame, eur: str, pct: 
         label_axes(ch, "Battery storage installed in Spain (GW)", y_title)
         ch.legend = None
         ws.add_chart(ch, anchor)
+
+
+def scatter(ws, title: str, y_title: str, x_ref: tuple[int, int, int], columns: list[int], anchor: str):
+    """Scatter chart with lines and markers: x in column x_ref[0], rows x_ref[1]..x_ref[2],
+    one series per column, titled from the header row just above."""
+    col_x, first, last = x_ref
+    ch = ScatterChart()
+    ch.title = title
+    ch.style = 13
+    ch.height, ch.width = 9, 18
+    x = Reference(ws, min_col=col_x, min_row=first, max_row=last)
+    for col in columns:
+        series = Series(Reference(ws, min_col=col, min_row=first - 1, max_row=last), x, title_from_data=True)
+        series.marker.symbol = "circle"
+        series.marker.size = 6
+        series.smooth = False
+        ch.series.append(series)
+    ch.y_axis.scaling.min = 0
+    ch.x_axis.scaling.min = 0
+    label_axes(ch, "Battery storage installed in Spain (GW)", y_title)
+    ws.add_chart(ch, anchor)
+
+
+def add_impact_model_sheet(
+    wb: Workbook, scores: pd.DataFrame, by_gw: pd.DataFrame, revenue: pd.DataFrame, eur: str, pct: str
+) -> None:
+    """Sheet with the stage-2 validation written by 08_fit_impact_model.py.
+
+    The best model is the one with the smallest mean revenue error over the
+    fleet sizes, the same rule the script uses to choose the model it saves.
+    """
+    errors = revenue.drop(columns=["GW", "simulated"]).div(revenue["simulated"], axis=0) - 1
+    ranking = errors.drop(columns="no impact").abs().mean().sort_values()
+    best = ranking.index[0]
+    base = best.removesuffix(" + calibrated")
+
+    ws = wb.create_sheet("Impact model")
+    ws.sheet_view.showGridLines = False
+    ws["A1"] = "Stage 2 · Statistical model of the price impact of storage"
+    ws["A1"].font = F_TITLE
+    notes = [
+        "The model learns from the simulated days how much X GW of storage move the price of each quarter "
+        "hour, so that it can be applied to a price forecast, where there are no OMIE curves.",
+        "Every figure is on months the model did not see: each month is predicted by a model fitted on "
+        "the others (leave one month out).",
+        f"Best model: {best}, chosen by the smallest revenue error over fleet sizes.",
+    ]
+    for i, text in enumerate(notes, start=2):
+        ws.cell(row=i, column=1, value=text).font = F_NOTE
+
+    # 1. Price error per model
+    row = 6
+    ws.cell(row=row, column=1, value="1. Error of the predicted price with storage").font = F_TITLE
+    view = scores.rename(columns={"model": "Model"})
+    row = table(ws, row + 1, view, {c: (eur if "MAE" in c else "0.000") for c in view.columns[1:]}) + 1
+    note = (
+        "MAE in €/MWh. Cheapest / dearest 10%: the periods of each day where storage charges / "
+        "discharges. R²: share of the impact explained (1 = all)."
+    )
+    ws.cell(row=row, column=1, value=note).font = F_NOTE
+
+    # 2. Revenue curve: simulated against the model's prices
+    row += 3
+    ws.cell(row=row, column=1, value="2. Revenue of each MW of storage (€/MW/year)").font = F_TITLE
+    curves = {"Simulated (OMIE curves)": revenue["simulated"], f"Model: {best}": revenue[best]}
+    if base != best:
+        curves[f"Before calibration: {base}"] = revenue[base]
+    curves["Ignoring cannibalisation"] = revenue["no impact"]
+    gaps = {f"Error: {best}": errors[best]}
+    if base != best:
+        gaps["Error before calibration"] = errors[base]
+    gaps["Error ignoring cannibalisation"] = errors["no impact"]
+    view = pd.DataFrame({"Storage installed (GW)": revenue["GW"]} | curves | gaps)
+    first = row + 2
+    formats = {"Storage installed (GW)": "0.##"} | dict.fromkeys(curves, "#,##0") | dict.fromkeys(gaps, pct)
+    last = table(ws, row + 1, view, formats)
+    note = (
+        "The same simulated dispatch priced three ways. Spain-Portugal splits are left out, so the "
+        "simulated column can differ slightly from the Cannibalisation sheet."
+    )
+    ws.cell(row=last + 1, column=1, value=note).font = F_NOTE
+    title = "Revenue of each MW of storage (€/MW/year)"
+    scatter(ws, title, "€ per MW per year", (1, first, last), list(range(2, len(curves) + 2)), "K6")
+
+    # 3. Price error by fleet size
+    row = last + 4
+    ws.cell(row=row, column=1, value="3. Price error by fleet size, MAE (€/MWh)").font = F_TITLE
+    candidates = dict.fromkeys([best, base, "ridge", "rank lookup", "no impact"])
+    shown = [m for m in candidates if m in by_gw.columns]
+    view = by_gw[["GW", *shown]].rename(columns={"GW": "Storage installed (GW)"})
+    first = row + 2
+    last = table(ws, row + 1, view, {c: eur for c in shown} | {"Storage installed (GW)": "0.##"})
+    columns = list(range(2, len(shown) + 2))
+    scatter(ws, "Error of the predicted price by fleet size", "MAE (€/MWh)", (1, first, last), columns, "K26")
+    ws.column_dimensions["A"].width = 40
+    for j in range(2, 10):
+        ws.column_dimensions[get_column_letter(j)].width = 17
 
 
 def main() -> None:
@@ -392,6 +492,15 @@ def main() -> None:
             "No %s: run 03_simulate_impact.py and 05_fleet.py to add the Cannibalisation sheet.",
             fleet_file.name,
         )
+
+    reports = ROOT / "reports"
+    model_files = [reports / f"impact_model_{n}.csv" for n in ("scores", "by_gw", "revenue")]
+    if args.demo:
+        pass
+    elif all(f.exists() for f in model_files):
+        add_impact_model_sheet(wb, *(pd.read_csv(f) for f in model_files), eur, pct)
+    else:
+        log.info("No impact model results: run 08_fit_impact_model.py to add the Impact model sheet.")
 
     output = ROOT / "reports" / f"exploratory_analysis{'_demo' if args.demo else ''}.xlsx"
     output.parent.mkdir(parents=True, exist_ok=True)
