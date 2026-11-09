@@ -61,7 +61,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def main() -> None:
-    config = yaml.safe_load((ROOT / "config" / "base.yaml").read_text())
+    config = yaml.safe_load((ROOT / "config" / "base.yaml").read_text(encoding="utf-8"))
     processed = ROOT / config["data"]["processed_dir"]
     files = sorted((ROOT / config["impact"]["output_dir"]).glob("*.parquet"))
     if not files:

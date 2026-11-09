@@ -120,7 +120,7 @@ def plot(table: pd.DataFrame, days: str, output: Path) -> None:
 
 
 def main() -> None:
-    config = yaml.safe_load((ROOT / "config" / "base.yaml").read_text())
+    config = yaml.safe_load((ROOT / "config" / "base.yaml").read_text(encoding="utf-8"))
     source = ROOT / config["data"]["processed_dir"] / "fleet.csv"
     if not source.exists():
         raise SystemExit(f"{source} not found; run scripts/05_fleet.py first.")

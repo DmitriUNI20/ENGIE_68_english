@@ -79,7 +79,7 @@ def yearly(adjusted: pd.DataFrame, battery: Battery) -> pd.DataFrame:
 
 
 def main() -> None:
-    config = yaml.safe_load((ROOT / "config" / "base.yaml").read_text())
+    config = yaml.safe_load((ROOT / "config" / "base.yaml").read_text(encoding="utf-8"))
     cfg = config["projection"]
     processed = ROOT / config["data"]["processed_dir"]
     model_file = processed / "impact_model.joblib"
@@ -154,7 +154,7 @@ def main() -> None:
     prices_out.to_csv(reports / "projection_prices.csv", index=False, float_format="%.2f")
     summary.to_csv(reports / "projection_summary.csv", index=False)
     curve.to_csv(reports / "projection_curve.csv", index=False)
-    (reports / "projection_source.txt").write_text(source + "\n")
+    (reports / "projection_source.txt").write_text(source + "\n", encoding="utf-8")
 
     log.info("\nDone in %.0f s. By scenario and year (prices and spreads in EUR/MWh):\n", time.time() - t0)
     print(summary.round(1).to_string(index=False))

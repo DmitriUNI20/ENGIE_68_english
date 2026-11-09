@@ -147,7 +147,7 @@ def main() -> None:
     parser.add_argument("--check", action="store_true", help="validate the reader, download nothing")
     args = parser.parse_args()
 
-    config = yaml.safe_load((ROOT / "config" / "base.yaml").read_text())
+    config = yaml.safe_load((ROOT / "config" / "base.yaml").read_text(encoding="utf-8"))
     cfg = config["curves"]
     raw_dir, compact_dir = ROOT / cfg["raw_dir"], ROOT / cfg["compact_dir"]
     compact_dir.mkdir(parents=True, exist_ok=True)

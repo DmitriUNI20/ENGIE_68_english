@@ -43,7 +43,7 @@ def main() -> None:
     parser.add_argument("--find", metavar="TEXT", help="list ESIOS indicators whose name contains TEXT")
     args = parser.parse_args()
 
-    config = yaml.safe_load((ROOT / "config" / "base.yaml").read_text())
+    config = yaml.safe_load((ROOT / "config" / "base.yaml").read_text(encoding="utf-8"))
     with requests.Session() as s:
         if args.find:
             hits = find(s, args.find)

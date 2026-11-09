@@ -50,7 +50,7 @@ def cannibalisation_table(panel: pd.DataFrame) -> pd.DataFrame:
 
 
 def main() -> None:
-    config = yaml.safe_load((ROOT / "config" / "base.yaml").read_text())
+    config = yaml.safe_load((ROOT / "config" / "base.yaml").read_text(encoding="utf-8"))
     impact_dir = ROOT / config["impact"]["output_dir"]
     files = sorted(impact_dir.glob("*.parquet"))
     if not files:
