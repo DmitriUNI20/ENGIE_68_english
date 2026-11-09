@@ -135,21 +135,25 @@ def models() -> dict[str, object]:
     }
 
 
-def cross_validate(data: pd.DataFrame, features: list[str]) -> pd.DataFrame:
+def cross_validate(data: pd.DataFrame, features: list[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Leave-one-month-out scores for each model, plus the no-impact benchmark.
 
     MAE is of the price the model predicts (p0 + predicted delta) against the
     simulated p^X, in €/MWh, overall and in the cheapest and dearest decile of
     each day, where storage charges and discharges.
+
+    Also returns the out-of-month predictions: the rows used, with one column
+    `pred_<model>` of predicted delta per model, for the checks below.
     """
     data = data.dropna(subset=[*features, "delta"])
-    rows = []
+    rows, predicted = [], []
     for month in sorted(data["month_key"].unique()):
         train, test = data[data["month_key"] != month], data[data["month_key"] == month]
         preds = {"no impact": np.zeros(len(test))}
         for name, model in models().items():
             model.fit(train[features], train["delta"].to_numpy())
             preds[name] = model.predict(test[features])
+        predicted.append(test.assign(**{f"pred_{name}": p for name, p in preds.items()}))
         for name, p in preds.items():
             err = np.abs(p - test["delta"].to_numpy())
             rows.append(
@@ -166,7 +170,7 @@ def cross_validate(data: pd.DataFrame, features: list[str]) -> pd.DataFrame:
                     "sq_tot_sum": ((test["delta"] - test["delta"].mean()) ** 2).sum(),
                 }
             )
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows), pd.concat(predicted)
 
 
 def summarise(scores: pd.DataFrame) -> pd.DataFrame:
@@ -180,3 +184,39 @@ def summarise(scores: pd.DataFrame) -> pd.DataFrame:
         }
     )
     return out.sort_values("MAE (€/MWh)")
+
+
+def error_by_fleet_size(predicted: pd.DataFrame) -> pd.DataFrame:
+    """MAE (€/MWh) of each model for each fleet size, on unseen months: one column per model."""
+    names = [c.removeprefix("pred_") for c in predicted.columns if c.startswith("pred_")]
+    err = pd.DataFrame(
+        {n: (predicted[f"pred_{n}"] - predicted["delta"]).abs() for n in names}, index=predicted.index
+    )
+    return err.groupby(predicted["bess_gw"]).mean().rename_axis("GW")
+
+
+def revenue_check(predicted: pd.DataFrame, model: str) -> pd.DataFrame:
+    """Fleet revenue per MW and year from the simulated prices and from the model's, by fleet size.
+
+    Both use the simulated dispatch of the fleet, so the difference is only the
+    error of the predicted prices, weighted by the energy traded in each
+    period: what matters for the cannibalisation curve. "No impact" prices the
+    same dispatch at the original prices, i.e. ignoring cannibalisation.
+    Rows are those of the validation (Spain-Portugal splits are left out), so
+    the simulated column can differ slightly from fleet.csv.
+    """
+    energy = (predicted["discharge_mw"] - predicted["charge_mw"]) * predicted["hours"]
+    revenue = pd.DataFrame(
+        {
+            "simulated": energy * predicted["p_x"],
+            "model": energy * (predicted["p0"] + predicted[f"pred_{model}"]),
+            "no impact": energy * predicted["p0"],
+        }
+    )
+    gw = predicted["bess_gw"]
+    table = revenue.groupby(gw).sum()
+    days = predicted["day"].nunique()
+    table = table.div(table.index.to_series() * 1000, axis=0) * 365 / days
+    table["model error %"] = 100 * (table["model"] / table["simulated"] - 1)
+    table["no impact error %"] = 100 * (table["no impact"] / table["simulated"] - 1)
+    return table.rename_axis("GW")

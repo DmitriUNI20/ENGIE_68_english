@@ -7,8 +7,16 @@ fundamentals (07_download_fundamentals.py). Scores each model on months it
 has not seen (leave one month out), prints the comparison, fits the best one
 on all the data and saves it for stage 3.
 
+Then two checks of the best model, also on unseen months:
+    error by fleet size     MAE of each model for 1, 2, ... 20 GW
+    revenue check           revenue per MW and year from the model's prices
+                            against the simulated ones: does the model
+                            reproduce the cannibalisation curve?
+
 Writes:
     reports/impact_model_scores.csv     per-model scores
+    reports/impact_model_by_gw.csv      error by fleet size
+    reports/impact_model_revenue.csv    revenue check
     data/processed/impact_model.joblib  the fitted best model and its features
 """
 
@@ -22,7 +30,15 @@ import joblib
 import pandas as pd
 import yaml
 
-from pce68.model.impact_model import build_dataset, cross_validate, feature_columns, models, summarise
+from pce68.model.impact_model import (
+    build_dataset,
+    cross_validate,
+    error_by_fleet_size,
+    feature_columns,
+    models,
+    revenue_check,
+    summarise,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 log = logging.getLogger(__name__)
@@ -52,7 +68,7 @@ def main() -> None:
 
     t0 = time.time()
     log.info("Leave-one-month-out validation (a few minutes) ...")
-    scores = cross_validate(data, features)
+    scores, predicted = cross_validate(data, features)
     table = summarise(scores)
     log.info(
         "Done in %.0f s. Error of the predicted price with storage, on unseen months:\n", time.time() - t0
@@ -67,10 +83,31 @@ def main() -> None:
     out = processed / "impact_model.joblib"
     joblib.dump({"model": model, "features": features, "name": best}, out)
 
-    report = ROOT / "reports" / "impact_model_scores.csv"
-    report.parent.mkdir(parents=True, exist_ok=True)
-    table.to_csv(report)
-    log.info("\nBest: %s. Saved %s and %s", best, out, report)
+    reports = ROOT / "reports"
+    reports.mkdir(parents=True, exist_ok=True)
+    table.to_csv(reports / "impact_model_scores.csv")
+    log.info("\nBest: %s. Saved %s", best, out)
+
+    by_gw = error_by_fleet_size(predicted)
+    log.info("\nMAE (€/MWh) by fleet size, unseen months:\n")
+    print(by_gw[table.index].round(2).to_string())
+    by_gw.to_csv(reports / "impact_model_by_gw.csv")
+
+    revenue = revenue_check(predicted, best)
+    log.info("\nRevenue per MW and year (EUR), same dispatch priced three ways, unseen months (%s):\n", best)
+    print(
+        revenue.to_string(
+            formatters={
+                "simulated": "{:,.0f}".format,
+                "model": "{:,.0f}".format,
+                "no impact": "{:,.0f}".format,
+                "model error %": "{:+.1f}".format,
+                "no impact error %": "{:+.1f}".format,
+            }
+        )
+    )
+    revenue.to_csv(reports / "impact_model_revenue.csv")
+    log.info("\nWrote the three tables to %s", reports)
 
 
 if __name__ == "__main__":
