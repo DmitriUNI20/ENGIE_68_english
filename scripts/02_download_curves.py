@@ -66,13 +66,29 @@ def store(text: str, day: date, compact_dir: Path, raw_dir: Path, keep_raw: bool
         (raw_dir / file_name(day)).write_text(text, encoding=ENCODING)
 
 
-def published_by_day(prices: pd.DataFrame) -> dict[date, np.ndarray]:
+def published_by_day(prices: pd.DataFrame) -> dict[date, pd.DataFrame]:
     local = prices["timestamp_utc"].dt.tz_convert(TZ)
     ordered = prices.assign(day=local.dt.date).sort_values("timestamp_utc")
-    return {d: g["price_es"].to_numpy() for d, g in ordered.groupby("day")}
+    return {d: g[["price_es", "price_pt"]] for d, g in ordered.groupby("day")}
+
+
+def _summary(label: str, e: np.ndarray) -> None:
+    if e.size == 0:
+        return
+    log.info(
+        "  %-34s %7d %8.2f %7.0f%% %7.0f%% %9.2f",
+        label, e.size, e.mean(), 100 * (e <= 1).mean(), 100 * (e <= 5).mean(), np.quantile(e, 0.99),
+    )  # fmt: skip
 
 
 def check(compact_dir: Path, price_file: Path) -> None:
+    """Re-clear the effective curves of every compacted day against the published Spanish price.
+
+    The error is broken down by file layout (hourly files before 01/10/2025 have
+    no bid-type column, so rejected complex bids and the French flows cannot be
+    told apart) and by whether Spain and Portugal cleared apart: the curves are
+    Iberian, so on split periods the Spanish price does not come from one cross.
+    """
     files = sorted(compact_dir.glob("curves_*.parquet"))
     if not files:
         raise SystemExit(f"no compact curves in {compact_dir}; download some first.")
@@ -80,26 +96,44 @@ def check(compact_dir: Path, price_file: Path) -> None:
         raise SystemExit(f"{price_file} not found; run `make data` first.")
     published = published_by_day(pd.read_parquet(price_file))
 
-    errors, skipped = [], 0
+    rows, skipped = [], 0
     for path in files:
         day = pd.Timestamp(path.stem.split("_")[-1]).date()
-        curves = effective_curves(pd.read_parquet(path))
+        compacted = pd.read_parquet(path)
+        curves = effective_curves(compacted)
         prices = published.get(day)
         if prices is None or len(prices) != len(curves):
             skipped += 1
             continue
-        errors.append(reconstruction_error(curves, prices))
-    if not errors:
+        err = np.abs(reconstruction_error(curves, prices["price_es"].to_numpy()))
+        rows.append(
+            pd.DataFrame(
+                {
+                    "day": day,
+                    "quarter_hourly": bool((compacted["hours"] < 1).any()),
+                    "split": (prices["price_es"] - prices["price_pt"]).abs().to_numpy() > 0.005,
+                    "error": err,
+                }
+            )
+        )
+    if not rows:
         raise SystemExit("no day could be matched against a published price.")
+    r = pd.concat(rows, ignore_index=True)
 
-    e = np.abs(np.concatenate(errors))
-    log.info("Re-cleared %d periods of %d days against marginalpdbc (%d days skipped)",
-             len(e), len(errors), skipped)  # fmt: skip
-    log.info("  mean absolute error   %8.2f EUR/MWh", e.mean())
-    log.info("  periods within 1 EUR  %8.0f %%", 100 * (e <= 1).mean())
-    log.info("  periods within 5 EUR  %8.0f %%", 100 * (e <= 5).mean())
-    log.info("  99%% quantile          %8.2f EUR/MWh", np.quantile(e, 0.99))
-    log.info("The simulation calibrates each period to the published price, so this residual")
+    log.info("Re-cleared %d periods of %d days against marginalpdbc (%d days skipped: no price or",
+             len(r), r["day"].nunique(), skipped)  # fmt: skip
+    log.info("a different number of periods, e.g. daylight-saving days)\n")
+    log.info("  %-34s %7s %8s %8s %8s %9s", "", "periods", "MAE", "<=1 EUR", "<=5 EUR", "99% q.")
+    _summary("all", r["error"].to_numpy())
+    for qh, label in ((False, "hourly files (to 30/09/2025)"), (True, "quarter-hourly (from 01/10/2025)")):
+        part = r[r["quarter_hourly"] == qh]
+        _summary(label, part["error"].to_numpy())
+        _summary("  Spain and Portugal coupled", part.loc[~part["split"], "error"].to_numpy())
+        _summary("  Spain and Portugal split", part.loc[part["split"], "error"].to_numpy())
+
+    worst = r.groupby("day")["error"].mean().sort_values(ascending=False).head(5)
+    log.info("\n  Worst days (mean error, EUR/MWh): %s", ", ".join(f"{d} {v:.1f}" for d, v in worst.items()))
+    log.info("\nThe simulation calibrates each period to the published price, so this residual")
     log.info("only affects how the curve bends near the price, not the starting point.")
 
 
@@ -122,7 +156,12 @@ def main() -> None:
         return
 
     # Raw files from an earlier download: compact them instead of fetching again.
-    for raw in sorted(raw_dir.glob("curva_pbc_*.1")) if raw_dir.exists() else []:
+    raws = sorted(raw_dir.glob("curva_pbc_*.1")) if raw_dir.exists() else []
+    if raws:
+        log.info("Compacting %d curve files already in %s (about 1-2 s each) ...", len(raws), raw_dir)
+    for n, raw in enumerate(raws, start=1):
+        if n % 20 == 0 or n == len(raws):
+            log.info("  file %d of %d", n, len(raws))
         day = pd.Timestamp(raw.name[10:18]).date()
         if not compact_path(compact_dir, day).exists():
             try:
