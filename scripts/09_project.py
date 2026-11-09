@@ -7,8 +7,10 @@ config/base.yaml (`projection`), computes y_hat = f(t, X_s, z^E) with the model
 saved by 08_fit_impact_model.py and the adjusted forecast p' = y_hat * p^E.
 See src/pce68/model/projection.py for the details.
 
-Until ENGIE's forecast is in `projection.forecast_file`, a TEST forecast is
-used: the last 52 weeks of real prices (and ESIOS fundamentals) repeated for
+Until ENGIE's forecast is in `projection.forecast_file`, the baseline is the
+OMIP futures one if `projection.omip_futures` has prices (the last 52 weeks of
+real prices rescaled to each year's Spanish baseload future), else a TEST
+forecast: the last 52 weeks of real prices (and ESIOS fundamentals) repeated for
 each test year. Its results show how the method works, not a price outlook.
 
 For each scenario and year it also reports the mean price, the mean daily
@@ -36,7 +38,14 @@ import yaml
 
 from pce68.dispatch.battery import Battery, simulate_price_taker
 from pce68.model.impact_model import TZ, build_dataset, feature_columns, fit_model
-from pce68.model.projection import adjust, forecast_features, load_forecast, scenario_path, test_forecast
+from pce68.model.projection import (
+    adjust,
+    forecast_features,
+    futures_forecast,
+    load_forecast,
+    scenario_path,
+    test_forecast,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 log = logging.getLogger(__name__)
@@ -93,6 +102,7 @@ def main() -> None:
     t0 = time.time()
 
     forecast_file = ROOT / cfg["forecast_file"]
+    futures = cfg.get("omip_futures") or {}
     if forecast_file.exists():
         forecast = load_forecast(forecast_file)
         source = f"ENGIE forecast: {forecast_file.name}"
@@ -100,9 +110,18 @@ def main() -> None:
         prices = pd.read_parquet(processed / "omie_prices.parquet")
         fund_file = processed / "fundamentals.parquet"
         fundamentals = pd.read_parquet(fund_file) if fund_file.exists() else None
-        forecast = test_forecast(prices, fundamentals, cfg["test_years"])
-        source = "TEST forecast: last 52 weeks of real prices repeated each year. NOT a price outlook."
-        log.warning("No %s: using a %s", cfg["forecast_file"], source)
+        if futures:
+            forecast = futures_forecast(prices, fundamentals, futures)
+            levels = ", ".join(f"{y}: {v:g}" for y, v in sorted(futures.items()))
+            source = (
+                "OMIP futures baseline: last 52 weeks of real prices rescaled to the Spanish "
+                f"baseload future of each year (EUR/MWh {levels}"
+                + (f", OMIP prices of {cfg['omip_futures_date']})." if cfg.get("omip_futures_date") else ").")
+            )
+        else:
+            forecast = test_forecast(prices, fundamentals, cfg["test_years"])
+            source = "TEST forecast: last 52 weeks of real prices repeated each year. NOT a price outlook."
+        log.warning("No %s: using the %s", cfg["forecast_file"], source)
     local = forecast["timestamp_utc"].dt.tz_convert(TZ)
     log.info("%s\n%d quarter hours, %s to %s", source, len(forecast), local.min().date(), local.max().date())
 

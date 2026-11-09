@@ -112,6 +112,27 @@ def test_forecast(
     return out.ffill().bfill()
 
 
+def futures_forecast(
+    prices: pd.DataFrame, fundamentals: pd.DataFrame | None, futures: dict, last_day: str | None = None
+) -> pd.DataFrame:
+    """A public baseline: the shape of the last 52 weeks of real prices, rescaled each year to
+    the OMIP baseload future for Spain of that year (EUR/MWh).
+
+    Futures give the level the market expects for a whole year, not its hours;
+    the historical quarter hours give the shape (solar trough, evening peak). Each
+    year's prices are multiplied by future / mean of that year's base prices, so
+    the year averages the future and its spreads scale with it. Fundamentals are
+    the historical ones, unchanged.
+    """
+    years = sorted(int(y) for y in futures)
+    out = test_forecast(prices, fundamentals, years, last_day)
+    year = out["timestamp_utc"].dt.tz_convert(TZ).dt.year
+    level = out.groupby(year)["price"].transform("mean")
+    target = year.map({int(k): float(v) for k, v in futures.items()})
+    out["price"] = out["price"] * target / level
+    return out
+
+
 # ── Scenarios
 
 
