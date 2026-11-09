@@ -108,7 +108,7 @@ def main() -> None:
     base = best.removesuffix(" + calibrated")
     clean = data.dropna(subset=[*features, "delta"])
     model = fit_model(base, clean, features)
-    bundle = {"model": model, "features": features, "name": best}
+    bundle = {"model": model, "features": features, "name": best, "grid": sorted(clean["bess_gw"].unique())}
     if best != base:
         bundle["factors"] = size_factors(predicted, predicted[f"pred_{base}"]).to_dict()
         log.info("\nSize factors: %s", {k: round(v, 3) for k, v in bundle["factors"].items()})

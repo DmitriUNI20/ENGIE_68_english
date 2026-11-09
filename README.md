@@ -25,6 +25,7 @@ Step by step:
 | 6. Chart | `make plot` · `06_plot_fleet.py` | `reports/cannibalisation_curve.png` |
 | 7. Fundamentals | `make fundamentals` · `07_download_fundamentals.py` (`--find TEXT` to look up ids; needs the `ESIOS_TOKEN` environment variable) | `data/processed/fundamentals.parquet` |
 | 8. Impact model | `make model` · `08_fit_impact_model.py` | `reports/impact_model_scores.csv`, `impact_model_by_gw.csv`, `impact_model_revenue.csv`, `data/processed/impact_model.joblib` |
+| 9. Projection | `make project` · `09_project.py` (ENGIE's forecast in `projection.forecast_file`; without it, a test forecast) | `reports/projection_prices.csv`, `projection_summary.csv`, `projection_curve.csv`; a Projection sheet in the Excel |
 
 `make test` runs the tests. Parameters live in `config/base.yaml`.
 
@@ -42,6 +43,7 @@ Step by step:
 | `src/pce68/market/curves.py` | Clearing price of a period's curves and calibration to the historical price. |
 | `src/pce68/dispatch/fleet.py` | Dispatch of a fleet of X GW that moves the prices it trades at, up to the competitive equilibrium. |
 | `src/pce68/model/impact_model.py` | Stage 2: dataset, models (lookup, ridge, gradient boosting) and leave-one-month-out validation of the price impact; weighted and size-calibrated variants; error by fleet size and revenue check. |
+| `src/pce68/model/projection.py` | Stage 3: reads a price forecast, storage scenarios, and the BESS-adjusted forecast p' = y_hat · p^E. |
 | `src/pce68/market/impact.py` | Prices of each day with X GW of storage, and the impact y = pX / p0. |
 
 The assumptions behind each calculation are documented at the top of its module.

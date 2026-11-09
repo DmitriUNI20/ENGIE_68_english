@@ -45,3 +45,19 @@ fundamentals:
     demand: 1293       # Demanda real
     wind: 551          # Generación T.Real eólica
     solar_pv: 1295     # Generación T.Real solar fotovoltaica
+
+projection:
+  # Stage 3: the impact model applied to a price forecast (09_project.py).
+  # ENGIE's forecast goes here: CSV, Excel or parquet with `price` (EUR/MWh) and
+  # `datetime` (Spanish local time) or `timestamp_utc`, hourly or quarter-hourly;
+  # optionally `demand`, `wind`, `solar_pv` (MW). If the file does not exist, a
+  # TEST forecast is used instead: the last 52 weeks of real prices repeated
+  # for each of `test_years`.
+  forecast_file: data/external/engie_forecast.csv
+  test_years: [2027, 2028, 2029, 2030]
+  # Installed battery storage in Spain (GW) by scenario: year (1 January) or
+  # date -> GW, linear in between. ILLUSTRATIVE paths: replace them with ENGIE's.
+  scenarios:
+    No new storage: {2026: 0}
+    PNIEC 2030 (illustrative): {2026: 1, 2027: 4, 2028: 8, 2029: 12, 2030: 17}
+    Slow build-out (illustrative): {2026: 1, 2027: 2, 2028: 4, 2029: 6, 2030: 8}

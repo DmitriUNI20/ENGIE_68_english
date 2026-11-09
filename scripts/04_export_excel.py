@@ -19,6 +19,8 @@ Sheets:
     Impact model    stage 2: how well the statistical model reproduces the
                     simulator on months it did not see, and the revenue curve
                     from its prices (only if 08_fit_impact_model.py has run)
+    Projection      stage 3: the price forecast adjusted for each storage
+                    scenario (only if 09_project.py has run)
 """
 
 from __future__ import annotations
@@ -181,7 +183,16 @@ def add_cannibalisation_sheet(wb: Workbook, fleet: pd.DataFrame, eur: str, pct: 
         ws.add_chart(ch, anchor)
 
 
-def scatter(ws, title: str, y_title: str, x_ref: tuple[int, int, int], columns: list[int], anchor: str):
+def scatter(
+    ws,
+    title: str,
+    y_title: str,
+    x_ref: tuple[int, int, int],
+    columns: list[int],
+    anchor: str,
+    x_title: str = "Battery storage installed in Spain (GW)",
+    x_range: tuple[float, float] | None = None,
+):
     """Scatter chart with lines and markers: x in column x_ref[0], rows x_ref[1]..x_ref[2],
     one series per column, titled from the header row just above."""
     col_x, first, last = x_ref
@@ -198,8 +209,81 @@ def scatter(ws, title: str, y_title: str, x_ref: tuple[int, int, int], columns: 
         ch.series.append(series)
     ch.y_axis.scaling.min = 0
     ch.x_axis.scaling.min = 0
-    label_axes(ch, "Battery storage installed in Spain (GW)", y_title)
+    if x_range:  # e.g. years: the axis would otherwise start at 0
+        ch.x_axis.scaling.min, ch.x_axis.scaling.max = x_range
+        ch.x_axis.majorUnit = 1
+    label_axes(ch, x_title, y_title)
     ws.add_chart(ch, anchor)
+
+
+def add_projection_sheet(
+    wb: Workbook, summary: pd.DataFrame, curve: pd.DataFrame, source: str, eur: str
+) -> None:
+    """Sheet with the stage-3 results of 09_project.py: the BESS-adjusted forecast by scenario."""
+    ws = wb.create_sheet("Projection")
+    ws.sheet_view.showGridLines = False
+    ws["A1"] = "Stage 3 · Price forecast adjusted for battery storage"
+    ws["A1"].font = F_TITLE
+    ws["A2"] = source
+    ws["A2"].font = Font(name="Arial", size=10, bold=True, color="C00000" if "TEST" in source else "1F3864")
+    notes = [
+        "For each storage scenario the impact model gives y = f(t, X, z) and the adjusted forecast "
+        "p' = y · p (roadmap, step 3). Scenario paths are in config/base.yaml (projection.scenarios).",
+        "Revenue: 1 MW of 2 h battery trading on the prices (price taker, perfect foresight, one cycle a "
+        "day, day-ahead only): what one more MW would earn with X GW installed. An upper bound.",
+    ]
+    for i, text in enumerate(notes, start=3):
+        ws.cell(row=i, column=1, value=text).font = F_NOTE
+
+    # 1. By scenario and year
+    row = 6
+    ws.cell(row=row, column=1, value="1. By scenario and year").font = F_TITLE
+    view = summary.rename(
+        columns={
+            "scenario": "Scenario",
+            "year": "Year",
+            "GW (mean)": "Storage (GW, mean)",
+            "mean price base": "Mean price, base (€/MWh)",
+            "mean price adjusted": "Mean price, adjusted (€/MWh)",
+            "daily spread base": "Daily spread, base (€/MWh)",
+            "daily spread adjusted": "Daily spread, adjusted (€/MWh)",
+            "revenue base (EUR/MW/yr)": "Revenue, base (€/MW/yr)",
+            "revenue adjusted (EUR/MW/yr)": "Revenue, adjusted (€/MW/yr)",
+        }
+    )
+    formats = {c: (eur if "€/MWh" in c else "#,##0") for c in view.columns[2:]}
+    formats |= {"Year": "0", "Storage (GW, mean)": "0.0"}
+    last = table(ws, row + 1, view, formats)
+
+    # 2. Revenue by year, one column per scenario
+    row = last + 3
+    ws.cell(row=row, column=1, value="2. Revenue of 1 MW of storage by scenario (€/MW/yr)").font = F_TITLE
+    pivot = summary.pivot(index="year", columns="scenario", values="revenue adjusted (EUR/MW/yr)")
+    pivot = pivot[list(dict.fromkeys(summary["scenario"]))].reset_index().rename(columns={"year": "Year"})
+    first = row + 2
+    last = table(ws, row + 1, pivot, {"Year": "0"} | dict.fromkeys(pivot.columns[1:], "#,##0"))
+    columns = list(range(2, pivot.shape[1] + 1))
+    scatter(ws, "Revenue of 1 MW of storage by scenario", "€ per MW per year", (1, first, last), columns,
+            "L6", x_title="Year", x_range=(pivot["Year"].min(), pivot["Year"].max()))  # fmt: skip
+
+    # 3. Cannibalisation curve on the forecast: fixed sizes, one column per year
+    row = last + 3
+    ws.cell(
+        row=row, column=1, value="3. Revenue of 1 MW with X GW installed, by year (€/MW/yr)"
+    ).font = F_TITLE
+    pivot = curve.pivot(index="GW", columns="year", values="revenue (EUR/MW/yr)").reset_index()
+    pivot.columns = ["Storage installed (GW)", *[str(c) for c in pivot.columns[1:]]]
+    first = row + 2
+    last = table(
+        ws, row + 1, pivot, {"Storage installed (GW)": "0.##"} | dict.fromkeys(pivot.columns[1:], "#,##0")
+    )
+    columns = list(range(2, pivot.shape[1] + 1))
+    scatter(
+        ws, "Cannibalisation curve on the forecast", "€ per MW per year", (1, first, last), columns, "L26"
+    )
+    ws.column_dimensions["A"].width = 30
+    for j in range(2, 11):
+        ws.column_dimensions[get_column_letter(j)].width = 16
 
 
 def add_impact_model_sheet(
@@ -501,6 +585,15 @@ def main() -> None:
         add_impact_model_sheet(wb, *(pd.read_csv(f) for f in model_files), eur, pct)
     else:
         log.info("No impact model results: run 08_fit_impact_model.py to add the Impact model sheet.")
+
+    projection = [reports / f"projection_{n}" for n in ("summary.csv", "curve.csv", "source.txt")]
+    if args.demo:
+        pass
+    elif all(f.exists() for f in projection):
+        proj_summary, proj_curve = (pd.read_csv(f) for f in projection[:2])
+        add_projection_sheet(wb, proj_summary, proj_curve, projection[2].read_text().strip(), eur)
+    else:
+        log.info("No projection: run 09_project.py to add the Projection sheet.")
 
     output = ROOT / "reports" / f"exploratory_analysis{'_demo' if args.demo else ''}.xlsx"
     output.parent.mkdir(parents=True, exist_ok=True)

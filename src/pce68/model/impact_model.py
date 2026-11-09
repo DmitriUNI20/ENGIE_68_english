@@ -65,6 +65,45 @@ def _mean_of_extremes(prices: pd.Series, hours: pd.Series, duration: float, top:
     return float((prices.nlargest(n) if top else prices.nsmallest(n)).mean())
 
 
+def add_features(d: pd.DataFrame, duration_hours: float, keys: list[str]) -> pd.DataFrame:
+    """Calendar and daily price-shape features. Needs timestamp_utc, hours, p0 and the `keys`
+    that identify one day's prices (day, plus bess_gw in the panel, where days repeat per X)."""
+    d = d.copy()
+    local = d["timestamp_utc"].dt.tz_convert(TZ)
+    d["hour"] = local.dt.hour
+    d["quarter"] = local.dt.minute // 15
+    d["weekday"] = local.dt.weekday
+    d["weekend"] = (d["weekday"] >= 5).astype(int)
+    month = local.dt.month
+    d["month_sin"], d["month_cos"] = np.sin(2 * np.pi * month / 12), np.cos(2 * np.pi * month / 12)
+    d["month_key"] = local.dt.strftime("%Y-%m")
+
+    by_day = d.groupby(keys)["p0"]
+    d["p0_rank"] = by_day.rank(pct=True)
+    d["day_mean"] = by_day.transform("mean")
+    d["day_spread"] = by_day.transform("max") - by_day.transform("min")
+    # Mean price of the dearest and cheapest `duration_hours` of the day: where the fleet trades.
+    for name, top in (("day_top_2h", True), ("day_bottom_2h", False)):
+        per_day = d.groupby(keys)[["p0", "hours"]].apply(
+            lambda g, top=top: _mean_of_extremes(g["p0"], g["hours"], duration_hours, top)
+        )
+        idx = d.set_index(keys).index
+        d[name] = idx.map(per_day).to_numpy()
+    return d
+
+
+def join_fundamentals(d: pd.DataFrame, fundamentals: pd.DataFrame | None) -> pd.DataFrame:
+    """Join demand, wind, solar ... by quarter hour (UTC) and add the renewable share."""
+    if fundamentals is None:
+        return d
+    f = fundamentals.copy()
+    if {"wind", "solar_pv", "demand"} <= set(f.columns):
+        f["renewable_share"] = (f["wind"] + f["solar_pv"]) / f["demand"]
+    return d.drop(columns=[c for c in f.columns if c != "timestamp_utc" and c in d]).merge(
+        f, on="timestamp_utc", how="left"
+    )
+
+
 def build_dataset(
     panel: pd.DataFrame, fundamentals: pd.DataFrame | None, duration_hours: float = 2.0
 ) -> pd.DataFrame:
@@ -82,26 +121,7 @@ def build_dataset(
     d["timestamp_utc"] = local_midnight.dt.tz_convert("UTC") + pd.to_timedelta(
         (d["period"] - 1) * d["hours"], unit="h"
     )
-    local = d["timestamp_utc"].dt.tz_convert(TZ)
-    d["hour"] = local.dt.hour
-    d["quarter"] = local.dt.minute // 15
-    d["weekday"] = local.dt.weekday
-    d["weekend"] = (d["weekday"] >= 5).astype(int)
-    month = local.dt.month
-    d["month_sin"], d["month_cos"] = np.sin(2 * np.pi * month / 12), np.cos(2 * np.pi * month / 12)
-    d["month_key"] = local.dt.strftime("%Y-%m")
-
-    by_day = d.groupby(["day", "bess_gw"])["p0"]
-    d["p0_rank"] = by_day.rank(pct=True)
-    d["day_mean"] = by_day.transform("mean")
-    d["day_spread"] = by_day.transform("max") - by_day.transform("min")
-    # Mean price of the dearest and cheapest `duration_hours` of the day: where the fleet trades.
-    keys = ["day", "bess_gw"]
-    for name, top in (("day_top_2h", True), ("day_bottom_2h", False)):
-        per_day = d.groupby(keys)[["p0", "hours"]].apply(
-            lambda g, top=top: _mean_of_extremes(g["p0"], g["hours"], duration_hours, top)
-        )
-        d[name] = d.set_index(keys).index.map(per_day).to_numpy()
+    d = add_features(d, duration_hours, keys=["day", "bess_gw"])
 
     # Weight in the fit: 1, plus up to 4 more for the share of the fleet's power traded.
     if {"charge_mw", "discharge_mw"} <= set(d.columns):
@@ -110,11 +130,7 @@ def build_dataset(
     else:
         d["weight"] = 1.0
 
-    if fundamentals is not None:
-        f = fundamentals.copy()
-        if {"wind", "solar_pv", "demand"} <= set(f.columns):
-            f["renewable_share"] = (f["wind"] + f["solar_pv"]) / f["demand"]
-        d = d.merge(f, on="timestamp_utc", how="left")
+    d = join_fundamentals(d, fundamentals)
     return d.reset_index(drop=True)
 
 
