@@ -1,4 +1,5 @@
 reports/*.xlsx
+reports/*.png
 /data/
 __pycache__/
 .venv/

@@ -1,4 +1,4 @@
-.PHONY: data curves impact excel excel-demo fleet test lint
+.PHONY: data curves impact excel excel-demo fleet plot test lint
 
 data:
 	uv run python scripts/01_download_omie.py
@@ -17,6 +17,9 @@ excel-demo:
 
 fleet:
 	uv run python scripts/05_fleet.py
+
+plot:
+	uv run python scripts/06_plot_fleet.py
 
 test:
 	uv run pytest -q
