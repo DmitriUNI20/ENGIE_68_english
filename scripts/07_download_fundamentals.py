@@ -11,10 +11,10 @@ yesterday), and writes data/processed/fundamentals.parquet: one row per
 quarter hour (UTC) and one column per indicator, plus residual demand
 (demand minus wind and solar) when those three are present.
 
-The ids in the config are a starting point taken from third-party lists that
-do not all agree. The script prints the official ESIOS name of each one it
-downloads: if a name is not what its column says, look the right id up with
---find and change it in the config.
+Each indicator in the config is an id or an official ESIOS name, which the
+script looks up in the catalogue. The script prints the official name of
+each one it downloads: if a name is not what its column says, look the right
+id up with --find and put it in the config.
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ import pandas as pd
 import requests
 import yaml
 
-from pce68.data.esios import find, indicator
+from pce68.data.esios import find, indicator, resolve
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 log = logging.getLogger(__name__)
@@ -59,9 +59,11 @@ def main() -> None:
         end = date.today() - timedelta(days=1)
         log.info("Downloading %d indicators from %s to %s ...\n", len(cfg["indicators"]), start, end)
         columns, failed = {}, []
-        for column, indicator_id in cfg["indicators"].items():
+        for column, ref in cfg["indicators"].items():
+            indicator_id = ref
             try:
-                name, series = indicator(s, int(indicator_id), start, end)
+                indicator_id = resolve(s, ref)
+                name, series = indicator(s, indicator_id, start, end)
             except Exception as e:  # noqa: BLE001 - report the indicator and carry on
                 log.warning("  %-14s id %-6s FAILED: %s", column, indicator_id, e)
                 failed.append(column)

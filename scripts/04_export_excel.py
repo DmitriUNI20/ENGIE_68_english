@@ -34,7 +34,7 @@ import numpy as np
 import pandas as pd
 import yaml
 from openpyxl import Workbook
-from openpyxl.chart import LineChart, Reference, ScatterChart, Series
+from openpyxl.chart import BarChart, LineChart, Reference, ScatterChart, Series
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
@@ -214,6 +214,7 @@ def scatter(
         ch.x_axis.majorUnit = 1
     label_axes(ch, x_title, y_title)
     ws.add_chart(ch, anchor)
+    return ch
 
 
 def add_projection_sheet(
@@ -287,7 +288,14 @@ def add_projection_sheet(
 
 
 def add_impact_model_sheet(
-    wb: Workbook, scores: pd.DataFrame, by_gw: pd.DataFrame, revenue: pd.DataFrame, eur: str, pct: str
+    wb: Workbook,
+    scores: pd.DataFrame,
+    by_gw: pd.DataFrame,
+    revenue: pd.DataFrame,
+    eur: str,
+    pct: str,
+    weights: pd.DataFrame | None = None,
+    conditions: pd.DataFrame | None = None,
 ) -> None:
     """Sheet with the stage-2 validation written by 08_fit_impact_model.py.
 
@@ -317,10 +325,12 @@ def add_impact_model_sheet(
     row = 6
     ws.cell(row=row, column=1, value="1. Error of the predicted price with storage").font = F_TITLE
     view = scores.rename(columns={"model": "Model"})
-    row = table(ws, row + 1, view, {c: (eur if "MAE" in c else "0.000") for c in view.columns[1:]}) + 1
+    formats = {c: (pct if "y =" in c else eur if "MAE" in c else "0.000") for c in view.columns[1:]}
+    row = table(ws, row + 1, view, formats) + 1
     note = (
         "MAE in €/MWh. Cheapest / dearest 10%: the periods of each day where storage charges / "
-        "discharges. R²: share of the impact explained (1 = all)."
+        "discharges. R²: share of the impact explained (1 = all). MAE of y: error of the roadmap's ratio "
+        "y = pX/p0 (where |p0| >= 5 €/MWh), e.g. 5% = 0.05."
     )
     ws.cell(row=row, column=1, value=note).font = F_NOTE
 
@@ -350,7 +360,7 @@ def add_impact_model_sheet(
     # 3. Price error by fleet size
     row = last + 4
     ws.cell(row=row, column=1, value="3. Price error by fleet size, MAE (€/MWh)").font = F_TITLE
-    candidates = dict.fromkeys([best, base, "ridge", "rank lookup", "no impact"])
+    candidates = dict.fromkeys([best, base, "GAM (splines)", "ridge", "rank lookup", "no impact"])
     shown = [m for m in candidates if m in by_gw.columns]
     view = by_gw[["GW", *shown]].rename(columns={"GW": "Storage installed (GW)"})
     first = row + 2
@@ -360,6 +370,62 @@ def add_impact_model_sheet(
     ws.column_dimensions["A"].width = 40
     for j in range(2, 10):
         ws.column_dimensions[get_column_letter(j)].width = 17
+
+    # 4. What the model leans on
+    if weights is not None:
+        row = last + 3
+        ws.cell(row=row, column=1, value=f"4. What the model leans on ({best})").font = F_TITLE
+        view = weights.head(12).set_axis(["Feature", "MAE increase if shuffled (€/MWh)"], axis=1)
+        first = row + 2
+        last = table(ws, row + 1, view, {"MAE increase if shuffled (€/MWh)": eur})
+        note = "Permutation importance: how much worse the model gets when one feature is shuffled."
+        ws.cell(row=last + 1, column=1, value=note).font = F_NOTE
+        ch = BarChart()
+        ch.type, ch.style, ch.height, ch.width = "bar", 13, 9, 18
+        ch.title = "What drives the predicted impact"
+        ch.add_data(Reference(ws, min_col=2, min_row=first - 1, max_row=last), titles_from_data=True)
+        ch.set_categories(Reference(ws, min_col=1, min_row=first, max_row=last))
+        ch.x_axis.scaling.orientation = "maxMin"  # largest on top
+        label_axes(ch, "Feature", "MAE increase (€/MWh)")
+        ch.legend = None
+        ws.add_chart(ch, f"K{row}")
+        last += 1
+
+    # 5. How the impact changes with market conditions
+    if conditions is not None and not conditions.empty:
+        gw = conditions["GW"].iloc[0]
+        row = last + 3
+        title = f"5. Mean price impact with {gw:g} GW, by hour and by renewable share (€/MWh, unseen months)"
+        ws.cell(row=row, column=1, value=title).font = F_TITLE
+        note = (
+            "Dearest 10%: periods where storage discharges, so prices fall. Cheapest 10%: where it "
+            "charges, so prices rise. Simulated with the OMIE curves against the model's prediction."
+        )
+        ws.cell(row=row + 1, column=1, value=note).font = F_NOTE
+        for dim, label in (("hour", "Hour"), ("renewable share quintile", "Renewable share quintile")):
+            part = conditions[conditions["dimension"] == dim]
+            if part.empty:
+                continue
+            wide = part.pivot(index="value", columns="side", values=["simulated", "model"])
+            wide.columns = [f"{side}, {source}" for source, side in wide.columns]
+            order = [c for c in ("dearest 10%, simulated", "dearest 10%, model", "cheapest 10%, simulated",
+                                 "cheapest 10%, model") if c in wide.columns]  # fmt: skip
+            view = wide[order].reset_index().rename(columns={"value": label})
+            first = row + 4
+            last = table(ws, row + 3, view, {label: "0"} | dict.fromkeys(order, eur))
+            x_title = "Hour of day (local time)" if dim == "hour" else "Renewable share quintile (1 = lowest)"
+            ch_title = f"Price impact with {gw:g} GW by {label.lower()}"
+            ch = scatter(
+                ws,
+                ch_title,
+                "€/MWh",
+                (1, first, last),
+                list(range(2, len(order) + 2)),
+                f"K{row + 2}",
+                x_title=x_title,
+            )
+            ch.y_axis.scaling.min = None  # impacts are negative in the dearest periods
+            row = last + 1
 
 
 def main() -> None:
@@ -582,7 +648,9 @@ def main() -> None:
     if args.demo:
         pass
     elif all(f.exists() for f in model_files):
-        add_impact_model_sheet(wb, *(pd.read_csv(f) for f in model_files), eur, pct)
+        extra = [reports / f"impact_model_{n}.csv" for n in ("importance", "conditions")]
+        weights, conditions = (pd.read_csv(f) if f.exists() else None for f in extra)
+        add_impact_model_sheet(wb, *(pd.read_csv(f) for f in model_files), eur, pct, weights, conditions)
     else:
         log.info("No impact model results: run 08_fit_impact_model.py to add the Impact model sheet.")
 

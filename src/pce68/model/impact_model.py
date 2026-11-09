@@ -12,20 +12,25 @@ the difference instead: Spain has hundreds of hours a year at or near zero,
 where the ratio explodes, while the difference stays bounded. The ratio follows
 from it, p^X / p0 = 1 + delta / p0, wherever p0 is not near zero.
 
-Features (z): calendar (hour, quarter, weekday, month), the original price and
-its rank within the day (storage charges in the cheapest periods and
+Features (z): calendar (hour, quarter, weekday, month), the original price, the
+prices an hour before and after, its rank within the day (storage charges in the cheapest periods and
 discharges in the dearest, so the rank drives the sign of delta), the day's
 price level and spread, and the fundamentals from ESIOS (demand, wind, solar,
-residual demand, renewable share). No day identifier, as the roadmap asks.
+residual demand, renewable share; hydro, nuclear and combined cycle when
+downloaded). No day identifier, as the roadmap asks.
+
+Models: the roadmap asks for a simple regularised regression or a generalised
+additive model (GAM) as a benchmark before tree-based models. Both are here:
+ridge, and a GAM where each feature enters through a smooth spline curve,
+multiplied by X so that the impact is zero without storage. Gradient
+boosting is the flexible model.
 
 Validation leaves one calendar month out at a time: the model is scored on a
 month it has not seen, so seasonal effects cannot leak from training to test.
 
-Two refinements aim at the fleet's revenue, which is what the cannibalisation
+One refinement aims at the fleet's revenue, which is what the cannibalisation
 curve needs:
 
-* weights: periods where the fleet charges or discharges weigh more in the
-  fit, as only they enter its revenue;
 * calibration by fleet size: regression shrinks the largest impacts towards
   the mean, so the fitted prices are too kind to storage. For each fleet size
   a factor rescales the predicted delta so that the revenue of the simulated
@@ -34,12 +39,15 @@ curve needs:
 
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 import pandas as pd
+from scipy.linalg import LinAlgWarning
 from sklearn.ensemble import HistGradientBoostingRegressor
 from sklearn.linear_model import Ridge
 from sklearn.pipeline import make_pipeline
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import SplineTransformer, StandardScaler
 
 TZ = "Europe/Madrid"
 
@@ -51,13 +59,24 @@ BASE_FEATURES = [
     "month_sin",
     "month_cos",
     "p0",
+    "p0_prev_1h",
+    "p0_next_1h",
     "p0_rank",
     "day_mean",
     "day_spread",
     "day_top_2h",
     "day_bottom_2h",
 ]
-FUNDAMENTALS = ["demand", "wind", "solar_pv", "residual_demand", "renewable_share"]
+FUNDAMENTALS = [
+    "demand",
+    "wind",
+    "solar_pv",
+    "residual_demand",
+    "renewable_share",
+    "hydro",
+    "nuclear",
+    "combined_cycle",
+]
 
 
 def _mean_of_extremes(prices: pd.Series, hours: pd.Series, duration: float, top: bool) -> float:
@@ -78,6 +97,11 @@ def add_features(d: pd.DataFrame, duration_hours: float, keys: list[str]) -> pd.
     d["month_sin"], d["month_cos"] = np.sin(2 * np.pi * month / 12), np.cos(2 * np.pi * month / 12)
     d["month_key"] = local.dt.strftime("%Y-%m")
 
+    # Neighbouring prices, an hour before and after within the same day (the edges repeat p0).
+    d = d.sort_values([*keys, "timestamp_utc"])
+    steps = (1 / d["hours"]).round().astype(int).clip(lower=1).iloc[0] if len(d) else 4
+    for name, shift in (("p0_prev_1h", steps), ("p0_next_1h", -steps)):
+        d[name] = d.groupby(keys)["p0"].shift(shift).fillna(d["p0"])
     by_day = d.groupby(keys)["p0"]
     d["p0_rank"] = by_day.rank(pct=True)
     d["day_mean"] = by_day.transform("mean")
@@ -89,16 +113,19 @@ def add_features(d: pd.DataFrame, duration_hours: float, keys: list[str]) -> pd.
         )
         idx = d.set_index(keys).index
         d[name] = idx.map(per_day).to_numpy()
-    return d
+    return d.sort_index()  # back to the input order
 
 
 def join_fundamentals(d: pd.DataFrame, fundamentals: pd.DataFrame | None) -> pd.DataFrame:
-    """Join demand, wind, solar ... by quarter hour (UTC) and add the renewable share."""
+    """Join demand, wind, solar ... by quarter hour (UTC) and add the renewable share (and the
+    residual demand, demand minus wind and solar, if not there yet)."""
     if fundamentals is None:
         return d
     f = fundamentals.copy()
     if {"wind", "solar_pv", "demand"} <= set(f.columns):
         f["renewable_share"] = (f["wind"] + f["solar_pv"]) / f["demand"]
+        if "residual_demand" not in f:
+            f["residual_demand"] = f["demand"] - f["wind"] - f["solar_pv"]
     return d.drop(columns=[c for c in f.columns if c != "timestamp_utc" and c in d]).merge(
         f, on="timestamp_utc", how="left"
     )
@@ -163,6 +190,39 @@ class RidgeWithStorage:
         return self.model.predict(self._design(x))
 
 
+class GamWithStorage:
+    """Generalised additive model of the impact: delta = X * sum_j f_j(z_j) + b X + c X².
+
+    Each feature z_j enters through a smooth curve f_j (cubic splines, fitted
+    by ridge), so each curve can be drawn and read: how much one GW of storage
+    moves the price as that feature changes, the others held fixed. Discrete
+    features (hour, weekday ...) get splines too, which is close enough.
+    """
+
+    def __init__(self, alpha: float = 10.0, n_knots: int = 5):
+        self.splines = SplineTransformer(n_knots=n_knots, degree=3, extrapolation="constant")
+        self.model = make_pipeline(StandardScaler(), Ridge(alpha=alpha))
+
+    def _design(self, x: pd.DataFrame, fit: bool) -> np.ndarray:
+        gw = x["bess_gw"].to_numpy(np.float32)[:, None]
+        other = x.drop(columns="bess_gw").to_numpy(np.float32)
+        basis = (self.splines.fit_transform(other) if fit else self.splines.transform(other)).astype(
+            np.float32
+        )
+        return np.hstack([basis * gw, other * gw**2, gw, gw**2])
+
+    def fit(self, x: pd.DataFrame, y: np.ndarray, sample_weight=None) -> GamWithStorage:
+        # The spline bases of each feature sum to one, so the design is collinear: the ridge
+        # penalty is what makes the fit unique, and scipy's warning about it is expected.
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", LinAlgWarning)
+            self.model.fit(self._design(x, fit=True), y, ridge__sample_weight=sample_weight)
+        return self
+
+    def predict(self, x: pd.DataFrame) -> np.ndarray:
+        return self.model.predict(self._design(x, fit=False))
+
+
 class RankLookup:
     """Benchmark: mean delta by decile of the price's rank within the day and by X."""
 
@@ -184,13 +244,13 @@ def models() -> dict[str, object]:
     return {
         "rank lookup": RankLookup(),
         "ridge": RidgeWithStorage(alpha=1.0),
+        "GAM (splines)": GamWithStorage(),
         "gradient boosting": _boosting(),
-        "gradient boosting, weighted": _boosting(),
     }
 
 
-WEIGHTED = {"gradient boosting, weighted"}
-CALIBRATED = ["gradient boosting", "gradient boosting, weighted"]
+WEIGHTED: set[str] = set()  # weighting trading periods was tried and did not help
+CALIBRATED = ["gradient boosting"]
 
 
 def fit_model(name: str, data: pd.DataFrame, features: list[str]):
@@ -249,12 +309,14 @@ def model_names(predicted: pd.DataFrame) -> list[str]:
     return [c.removeprefix("pred_") for c in predicted.columns if c.startswith("pred_")]
 
 
-def summarise(predicted: pd.DataFrame) -> pd.DataFrame:
+def summarise(predicted: pd.DataFrame, min_abs_price: float = 5.0) -> pd.DataFrame:
     """MAE of the predicted price with storage (€/MWh), overall and in each day's cheapest and
-    dearest 10 %, and R² (against each month's own mean), from out-of-month predictions."""
+    dearest 10 %, R² (against each month's own mean), and the MAE of the ratio y = pX/p0 of the
+    roadmap where |p0| >= min_abs_price, from out-of-month predictions."""
     delta = predicted["delta"]
     low, high = predicted["p0_rank"] <= 0.1, predicted["p0_rank"] > 0.9
     tot = ((delta - delta.groupby(predicted["month_key"]).transform("mean")) ** 2).sum()
+    valid = predicted["p0"].abs() >= min_abs_price  # the ratio, as the roadmap states it
     rows = {}
     for name in model_names(predicted):
         err = predicted[f"pred_{name}"] - delta
@@ -263,6 +325,7 @@ def summarise(predicted: pd.DataFrame) -> pd.DataFrame:
             "MAE cheapest 10%": err[low].abs().mean(),
             "MAE dearest 10%": err[high].abs().mean(),
             "R²": 1 - (err**2).sum() / tot,
+            "MAE of y = pX/p0": (err[valid] / predicted.loc[valid, "p0"]).abs().mean(),
         }
     return pd.DataFrame(rows).T.rename_axis("model").sort_values("MAE (€/MWh)")
 
@@ -303,3 +366,55 @@ def predict_delta(bundle: dict, x: pd.DataFrame) -> np.ndarray:
     if factors is not None:
         pred = pred * x["bess_gw"].map(factors).fillna(1.0).to_numpy()
     return pred
+
+
+# ── Transparency: what drives the impact
+
+
+def importance(bundle: dict, data: pd.DataFrame, n: int = 50_000, seed: int = 0) -> pd.Series:
+    """Permutation importance: how much the MAE (€/MWh) grows when one feature is shuffled.
+
+    Computed on a random sample of the training rows, with the fitted model.
+    A large value means the model leans on that feature.
+    """
+    rng = np.random.default_rng(seed)
+    sample = data.sample(min(n, len(data)), random_state=seed)
+    base = np.abs(predict_delta(bundle, sample) - sample["delta"]).mean()
+    out = {}
+    for f in bundle["features"]:
+        shuffled = sample.assign(**{f: rng.permutation(sample[f].to_numpy())})
+        out[f] = np.abs(predict_delta(bundle, shuffled) - sample["delta"]).mean() - base
+    return pd.Series(out, name="MAE increase (€/MWh)").sort_values(ascending=False)
+
+
+def impact_by_condition(predicted: pd.DataFrame, model: str, gw: float = 10) -> pd.DataFrame:
+    """Mean price impact (€/MWh) with `gw` GW of storage, simulated and predicted on unseen
+    months, in the day's dearest 10 % of periods (storage discharges, prices fall) and cheapest
+    10 % (it charges, prices rise), by hour, month and renewable-share quintile.
+
+    This is how the impact changes with market conditions, which the roadmap
+    asks the model to show, and a check that the model follows the simulator.
+    """
+    size = predicted["bess_gw"].unique()
+    d = predicted[predicted["bess_gw"] == size[np.abs(size - gw).argmin()]]
+    side = np.select([d["p0_rank"] > 0.9, d["p0_rank"] <= 0.1], ["dearest 10%", "cheapest 10%"], "")
+    d = d.assign(side=side)[side != ""]
+    groups = {
+        "hour": d["hour"],
+        "month": d["timestamp_utc"].dt.tz_convert(TZ).dt.month,
+    }
+    if "renewable_share" in d and d["renewable_share"].notna().any():
+        groups["renewable share quintile"] = (
+            pd.qcut(d["renewable_share"], 5, labels=False, duplicates="drop") + 1
+        )
+    rows = []
+    for dim, key in groups.items():
+        g = d.groupby([key.rename("value"), "side"])
+        rows.append(
+            pd.DataFrame({"simulated": g["delta"].mean(), "model": g[f"pred_{model}"].mean(), "n": g.size()})
+            .reset_index()
+            .assign(dimension=dim)
+        )
+    out = pd.concat(rows, ignore_index=True)
+    out["GW"] = d["bess_gw"].iloc[0]
+    return out[["dimension", "value", "side", "GW", "simulated", "model", "n"]]

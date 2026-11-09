@@ -19,6 +19,7 @@ consultasios@ree.es.
 from __future__ import annotations
 
 import os
+import unicodedata
 from datetime import date, timedelta
 
 import pandas as pd
@@ -57,6 +58,31 @@ def find(session, text: str) -> pd.DataFrame:
 
     hit = fold(catalogue["name"].fillna("")).str.contains(fold(pd.Series([text]))[0], regex=False)
     return catalogue.loc[hit, ["id", "name"]].sort_values("id").reset_index(drop=True)
+
+
+def resolve(session, ref) -> int:
+    """An indicator id from config: an id as is, or a name looked up in the ESIOS catalogue.
+
+    A name must match one indicator exactly (case and accents ignored), or be
+    contained in only one; otherwise the candidates are listed in the error,
+    to pick the right id with --find.
+    """
+    if isinstance(ref, int) or str(ref).strip().isdigit():
+        return int(ref)
+    hits = find(session, str(ref))
+    if hits.empty:
+        raise ValueError(f"no indicator named like {ref!r}")
+
+    def fold(text: str) -> str:
+        return unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii").lower()
+
+    exact = hits[hits["name"].map(fold).str.strip() == fold(str(ref)).strip()]
+    if len(exact) == 1:
+        return int(exact["id"].iloc[0])
+    if len(hits) == 1:
+        return int(hits["id"].iloc[0])
+    listed = "; ".join(f"{r.id} {r.name}" for r in hits.head(8).itertuples())
+    raise ValueError(f"{len(hits)} indicators match {ref!r}: {listed}. Put the right id in the config.")
 
 
 def peninsula(values: pd.DataFrame) -> pd.DataFrame:

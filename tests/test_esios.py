@@ -91,3 +91,23 @@ def test_missing_token_stops_with_a_clear_message(monkeypatch):
     monkeypatch.delenv("ESIOS_TOKEN")
     with pytest.raises(SystemExit, match="ESIOS_TOKEN"):
         esios.token()
+
+
+def test_resolve_takes_ids_and_looks_up_names(monkeypatch):
+    import pytest
+
+    from pce68.data import esios
+
+    catalogue = {
+        "indicators": [
+            {"id": 546, "name": "Generación T.Real hidráulica"},
+            {"id": 1, "name": "Generación T.Real hidráulica bombeo"},
+            {"id": 549, "name": "Generación T.Real nuclear"},
+        ]
+    }
+    monkeypatch.setattr(esios, "_get", lambda session, path, params=None: catalogue)
+    assert esios.resolve(None, 1293) == 1293 and esios.resolve(None, "551") == 551
+    assert esios.resolve(None, "generacion t.real HIDRAULICA") == 546  # exact match wins over the longer name
+    assert esios.resolve(None, "nuclear") == 549  # the only one containing it
+    with pytest.raises(ValueError, match="3 indicators"):
+        esios.resolve(None, "T.Real")  # ambiguous: listed so the user can pick an id
