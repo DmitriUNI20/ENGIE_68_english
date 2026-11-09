@@ -3,21 +3,27 @@
     python scripts/08_fit_impact_model.py        # or `make model`
 
 Reads the impact panel (03_simulate_impact.py) and, if present, the ESIOS
-fundamentals (07_download_fundamentals.py). Scores each model on months it
-has not seen (leave one month out), prints the comparison, fits the best one
-on all the data and saves it for stage 3.
+fundamentals (07_download_fundamentals.py), and predicts every month with
+models fitted on the others (leave one month out). Models compared:
 
-Then two checks of the best model, also on unseen months:
-    error by fleet size     MAE of each model for 1, 2, ... 20 GW
-    revenue check           revenue per MW and year from the model's prices
-                            against the simulated ones: does the model
-                            reproduce the cannibalisation curve?
+    no impact                       the price does not move (benchmark)
+    rank lookup, ridge              simple models
+    gradient boosting               trees
+    gradient boosting, weighted     trees, trading periods weigh more
+    ... + calibrated                with a factor per fleet size so that the
+                                    fleet's revenue matches on other months
+
+Prints three tables: price error, price error by fleet size, and the error
+of the fleet's revenue per MW and year by fleet size. The best model is the
+one with the smallest mean revenue error over the fleet sizes, as the
+cannibalisation curve is what stage 3 needs. It is fitted on all the data
+and saved.
 
 Writes:
-    reports/impact_model_scores.csv     per-model scores
-    reports/impact_model_by_gw.csv      error by fleet size
-    reports/impact_model_revenue.csv    revenue check
-    data/processed/impact_model.joblib  the fitted best model and its features
+    reports/impact_model_scores.csv     price error per model
+    reports/impact_model_by_gw.csv      price error by fleet size
+    reports/impact_model_revenue.csv    revenue per MW and year by fleet size and model
+    data/processed/impact_model.joblib  the fitted best model, its features and size factors
 """
 
 from __future__ import annotations
@@ -35,8 +41,11 @@ from pce68.model.impact_model import (
     cross_validate,
     error_by_fleet_size,
     feature_columns,
-    models,
-    revenue_check,
+    fit_model,
+    model_names,
+    revenue_by_model,
+    revenue_errors,
+    size_factors,
     summarise,
 )
 
@@ -61,53 +70,51 @@ def main() -> None:
             "No %s: fitting without demand, wind and solar (run 07_download_fundamentals.py).", fund_file.name
         )
 
-    data = build_dataset(panel, fundamentals)
+    data = build_dataset(panel, fundamentals, config["battery"]["duration_hours"])
     features = feature_columns(data)
     log.info("%d rows (%d days x periods x fleet sizes), %d months, features: %s",
              len(data), data["day"].nunique(), data["month_key"].nunique(), ", ".join(features))  # fmt: skip
 
     t0 = time.time()
     log.info("Leave-one-month-out validation (a few minutes) ...")
-    scores, predicted = cross_validate(data, features)
-    table = summarise(scores)
-    log.info(
-        "Done in %.0f s. Error of the predicted price with storage, on unseen months:\n", time.time() - t0
-    )
-    print(table.round(3).to_string())
-
-    best = table.index[0]
-    if best == "no impact":
-        raise SystemExit("No model beats 'no impact'; nothing saved.")
-    clean = data.dropna(subset=[*features, "delta"])
-    model = models()[best].fit(clean[features], clean["delta"].to_numpy())
-    out = processed / "impact_model.joblib"
-    joblib.dump({"model": model, "features": features, "name": best}, out)
-
+    predicted = cross_validate(data, features)
+    log.info("Done in %.0f s. All on months the models did not see.\n", time.time() - t0)
+    names = model_names(predicted)
     reports = ROOT / "reports"
     reports.mkdir(parents=True, exist_ok=True)
+
+    table = summarise(predicted)
+    log.info("Error of the predicted price with storage:\n")
+    print(table.round(3).to_string())
     table.to_csv(reports / "impact_model_scores.csv")
-    log.info("\nBest: %s. Saved %s", best, out)
 
     by_gw = error_by_fleet_size(predicted)
-    log.info("\nMAE (€/MWh) by fleet size, unseen months:\n")
-    print(by_gw[table.index].round(2).to_string())
+    log.info("\nMAE (€/MWh) by fleet size:\n")
+    print(by_gw[table.index].T.round(2).to_string())
     by_gw.to_csv(reports / "impact_model_by_gw.csv")
 
-    revenue = revenue_check(predicted, best)
-    log.info("\nRevenue per MW and year (EUR), same dispatch priced three ways, unseen months (%s):\n", best)
-    print(
-        revenue.to_string(
-            formatters={
-                "simulated": "{:,.0f}".format,
-                "model": "{:,.0f}".format,
-                "no impact": "{:,.0f}".format,
-                "model error %": "{:+.1f}".format,
-                "no impact error %": "{:+.1f}".format,
-            }
-        )
-    )
+    revenue = revenue_by_model(predicted)
+    errors = revenue_errors(revenue)
+    ranking = errors.drop(columns="no impact").abs().mean().sort_values()
+    log.info("\nRevenue per MW and year: simulated (EUR), then each model's error (%) against it:\n")
+    simulated = revenue[["simulated"]].T.map("{:,.0f}".format)
+    model_errors = errors.T.loc[[*ranking.index, "no impact"]].map("{:+.1f}".format)
+    shown = pd.concat([simulated, model_errors])
+    print(shown.rename_axis(None, axis=1).to_string())
+    log.info("\nMean absolute revenue error over fleet sizes (%%):\n%s", ranking.round(2).to_string())
     revenue.to_csv(reports / "impact_model_revenue.csv")
-    log.info("\nWrote the three tables to %s", reports)
+
+    best = ranking.index[0]
+    base = best.removesuffix(" + calibrated")
+    clean = data.dropna(subset=[*features, "delta"])
+    model = fit_model(base, clean, features)
+    bundle = {"model": model, "features": features, "name": best}
+    if best != base:
+        bundle["factors"] = size_factors(predicted, predicted[f"pred_{base}"]).to_dict()
+        log.info("\nSize factors: %s", {k: round(v, 3) for k, v in bundle["factors"].items()})
+    out = processed / "impact_model.joblib"
+    joblib.dump(bundle, out)
+    log.info("\nBest: %s (of %d). Saved %s; tables in %s", best, len(names), out, reports)
 
 
 if __name__ == "__main__":

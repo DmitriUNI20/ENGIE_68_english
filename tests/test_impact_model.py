@@ -53,15 +53,43 @@ def test_rank_lookup_learns_mean_delta_by_decile_and_size():
     assert np.allclose(model.predict(d), d["delta"])  # delta is -X everywhere here
 
 
-def test_revenue_check_prices_the_simulated_dispatch():
-    from pce68.model.impact_model import error_by_fleet_size, revenue_check
+def traded(d: pd.DataFrame) -> pd.DataFrame:
+    """Charge in the cheapest half of the day, discharge in the dearest, at full power."""
+    full, dear = 1000.0 * d["bess_gw"], d["p0"] > d["p0"].median()
+    return d.assign(charge_mw=np.where(dear, 0.0, full), discharge_mw=np.where(dear, full, 0.0))
 
-    d = build_dataset(panel(), None)
-    d["charge_mw"] = np.where(d["p0_rank"] <= 0.5, 1000.0 * d["bess_gw"], 0.0)
-    d["discharge_mw"] = np.where(d["p0_rank"] > 0.5, 1000.0 * d["bess_gw"], 0.0)
-    d["pred_perfect"] = d["delta"]
-    d["pred_no impact"] = 0.0
-    r = revenue_check(d, "perfect")
-    assert np.allclose(r["model error %"], 0)
+
+def test_extremes_and_weights():
+    d = build_dataset(traded(panel()), None)
+    prices = np.linspace(10, 105, 96)[1:]  # period 1 is a split, dropped
+    assert np.isclose(d["day_top_2h"].iloc[0], prices[-8:].mean())  # 2 h = 8 quarter hours
+    assert np.isclose(d["day_bottom_2h"].iloc[0], prices[:8].mean())
+    assert set(d["weight"]) == {5.0}  # full power traded in every period here
+    assert set(build_dataset(panel(), None)["weight"]) == {1.0}  # no dispatch columns: equal weights
+
+
+def test_size_factors_rescale_to_the_simulated_revenue():
+    from pce68.model.impact_model import predict_delta, size_factors
+
+    d = build_dataset(traded(panel()), None)
+    half = d["delta"] / 2  # a model that predicts only half of each impact
+    factors = size_factors(d, half)
+    assert np.allclose(factors, 2.0)
+
+    class Half:
+        def predict(self, x):
+            return x["bess_gw"].to_numpy() * -0.5
+
+    bundle = {"model": Half(), "features": ["bess_gw"], "factors": factors.to_dict()}
+    assert np.allclose(predict_delta(bundle, d), d["delta"])
+
+
+def test_revenue_and_errors_by_model():
+    from pce68.model.impact_model import error_by_fleet_size, revenue_by_model, revenue_errors
+
+    d = build_dataset(traded(panel()), None)
+    d = d.assign(**{"pred_perfect": d["delta"], "pred_no impact": 0.0})
+    errors = revenue_errors(revenue_by_model(d))
+    assert np.allclose(errors["perfect"], 0)
     e = error_by_fleet_size(d)
     assert np.allclose(e["perfect"], 0) and np.allclose(e.loc[2, "no impact"], 2)
