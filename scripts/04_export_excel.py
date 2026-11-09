@@ -13,6 +13,9 @@ Sheets:
     Annual          price, dispersion, zero-price hours and spread per year
     Monthly         the same series by month, with a chart
     Hourly profile  mean price per hour and year: the duck curve
+    Cannibalisation revenue per MW and spread against GW of storage, from
+                    05_fleet.py (only if data/processed/fleet.csv exists:
+                    run 03_simulate_impact.py and 05_fleet.py before this)
 """
 
 from __future__ import annotations
@@ -26,7 +29,7 @@ import numpy as np
 import pandas as pd
 import yaml
 from openpyxl import Workbook
-from openpyxl.chart import LineChart, Reference
+from openpyxl.chart import LineChart, Reference, ScatterChart, Series
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
@@ -98,7 +101,7 @@ def table(ws, row0, df: pd.DataFrame, formats: dict[str, str] | None = None) -> 
     return row0 + len(df)
 
 
-def label_axes(ch: LineChart, x_title: str, y_title: str) -> None:
+def label_axes(ch: LineChart | ScatterChart, x_title: str, y_title: str) -> None:
     """Give a chart axis titles and make sure Excel draws both axes.
 
     openpyxl 3.1 marks axes as deleted by default, and some Excel versions
@@ -109,6 +112,70 @@ def label_axes(ch: LineChart, x_title: str, y_title: str) -> None:
     ch.x_axis.delete = False
     ch.y_axis.delete = False
     ch.legend.position = "b"
+
+
+def add_cannibalisation_sheet(wb: Workbook, fleet: pd.DataFrame, eur: str, pct: str) -> None:
+    """Sheet with the table of 05_fleet.py and its two curves, as native Excel charts.
+
+    Scatter charts with lines, not line charts: fleet sizes are unevenly
+    spaced (0, 1, 2, 4, 6 ... GW) and a line chart would draw them evenly.
+    Two charts rather than one with two y axes, as the units differ.
+    """
+    ws = wb.create_sheet("Cannibalisation")
+    ws.sheet_view.showGridLines = False
+    ws["A1"] = "Self-cannibalisation of battery storage"
+    ws["A1"].font = F_TITLE
+    ws["A2"] = (
+        "Revenue of each MW of storage as more storage is installed in Spain. OMIE curves, "
+        "perfect foresight, day-ahead energy only: an upper bound. PNIEC 2030 target: about 17 GW."
+    )
+    ws["A2"].font = F_NOTE
+    view = pd.DataFrame(
+        {
+            "Storage installed (GW)": fleet["bess_gw"],
+            "Revenue (€/MW/year)": fleet["revenue_eur_per_mw_year"],
+            "vs smallest fleet": fleet["vs_smallest_fleet"],
+            "Mean daily spread (€/MWh)": fleet["spread"],
+            "Mean price (€/MWh)": fleet["mean_price"],
+        }
+    )
+    first, last = (
+        5,
+        table(
+            ws,
+            4,
+            view,
+            {
+                "Storage installed (GW)": "0.##",
+                "Revenue (€/MW/year)": "#,##0",
+                "vs smallest fleet": pct,
+                "Mean daily spread (€/MWh)": eur,
+                "Mean price (€/MWh)": eur,
+            },
+        ),
+    )
+
+    for col, title, y_title, anchor in (
+        (2, "Revenue of each MW of storage (€/MW/year)", "€ per MW per year", "G4"),
+        (4, "Mean daily price spread, max - min (€/MWh)", "€/MWh", "G24"),
+    ):
+        # Revenue is empty at 0 GW (no fleet to divide by): start the series at its first value.
+        start = first + int(view.iloc[:, col - 1].isna().idxmin())
+        ch = ScatterChart()
+        ch.title = title
+        ch.style = 13
+        ch.height, ch.width = 9, 18
+        x = Reference(ws, min_col=1, min_row=start, max_row=last)
+        series = Series(Reference(ws, min_col=col, min_row=start, max_row=last), x, title=title)
+        series.marker.symbol = "circle"
+        series.marker.size = 7
+        series.smooth = False
+        ch.series.append(series)
+        ch.y_axis.scaling.min = 0
+        ch.x_axis.scaling.min = 0
+        label_axes(ch, "Battery storage installed in Spain (GW)", y_title)
+        ch.legend = None
+        ws.add_chart(ch, anchor)
 
 
 def main() -> None:
@@ -314,6 +381,17 @@ def main() -> None:
     ch.set_categories(Reference(ws, min_col=1, min_row=5, max_row=last))
     label_axes(ch, "Hour of day (local time, 0-23)", "Mean price (€/MWh)")
     ws.add_chart(ch, get_column_letter(len(profile.columns) + 2) + "4")
+
+    fleet_file = ROOT / config["data"]["processed_dir"] / "fleet.csv"
+    if args.demo:
+        pass  # the fleet table comes from real curves, not from the synthetic prices
+    elif fleet_file.exists():
+        add_cannibalisation_sheet(wb, pd.read_csv(fleet_file), eur, pct)
+    else:
+        log.info(
+            "No %s: run 03_simulate_impact.py and 05_fleet.py to add the Cannibalisation sheet.",
+            fleet_file.name,
+        )
 
     output = ROOT / "reports" / f"exploratory_analysis{'_demo' if args.demo else ''}.xlsx"
     output.parent.mkdir(parents=True, exist_ok=True)
