@@ -51,3 +51,17 @@ def test_rank_lookup_learns_mean_delta_by_decile_and_size():
     d = build_dataset(panel(), None)
     model = RankLookup().fit(d, d["delta"].to_numpy())
     assert np.allclose(model.predict(d), d["delta"])  # delta is -X everywhere here
+
+
+def test_revenue_check_prices_the_simulated_dispatch():
+    from pce68.model.impact_model import error_by_fleet_size, revenue_check
+
+    d = build_dataset(panel(), None)
+    d["charge_mw"] = np.where(d["p0_rank"] <= 0.5, 1000.0 * d["bess_gw"], 0.0)
+    d["discharge_mw"] = np.where(d["p0_rank"] > 0.5, 1000.0 * d["bess_gw"], 0.0)
+    d["pred_perfect"] = d["delta"]
+    d["pred_no impact"] = 0.0
+    r = revenue_check(d, "perfect")
+    assert np.allclose(r["model error %"], 0)
+    e = error_by_fleet_size(d)
+    assert np.allclose(e["perfect"], 0) and np.allclose(e.loc[2, "no impact"], 2)
