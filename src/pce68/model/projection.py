@@ -29,7 +29,7 @@ import pandas as pd
 
 from pce68.model.impact_model import TZ, add_features, join_fundamentals, predict_delta
 
-FUNDAMENTAL_COLUMNS = ["demand", "wind", "solar_pv"]
+FUNDAMENTAL_COLUMNS = ["demand", "wind", "solar_pv", "hydro", "nuclear", "combined_cycle"]
 
 
 # ── Forecast input
@@ -51,7 +51,8 @@ def load_forecast(path: Path) -> pd.DataFrame:
 
     Columns: `price` (€/MWh) and either `timestamp_utc` (UTC) or `datetime`
     (Spanish local time; the start of each hour or quarter hour). Optional:
-    `demand`, `wind`, `solar_pv` (MW), used by the model when present.
+    `demand`, `wind`, `solar_pv`, `hydro`, `nuclear`, `combined_cycle` (MW),
+    used by the model when present.
     """
     if path.suffix.lower() in (".xlsx", ".xls"):
         raw = pd.read_excel(path)

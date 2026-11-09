@@ -93,3 +93,38 @@ def test_revenue_and_errors_by_model():
     assert np.allclose(errors["perfect"], 0)
     e = error_by_fleet_size(d)
     assert np.allclose(e["perfect"], 0) and np.allclose(e.loc[2, "no impact"], 2)
+
+
+def test_neighbouring_prices_stay_within_the_day():
+    d = build_dataset(panel(), None)
+    one = d[d["bess_gw"] == 1].sort_values("period").reset_index(drop=True)
+    assert np.allclose(one["p0_prev_1h"].iloc[4:], one["p0"].shift(4).iloc[4:])  # 4 quarter hours back
+    assert one["p0_prev_1h"].iloc[0] == one["p0"].iloc[0]  # day edge: own price
+    assert one["p0_next_1h"].iloc[-1] == one["p0"].iloc[-1]
+
+
+def test_gam_is_zero_without_storage_and_learns_a_linear_impact():
+    from pce68.model.impact_model import GamWithStorage
+
+    d = build_dataset(panel(gws=(0, 1, 2, 4)), None)
+    x = d[["hour", "p0", "p0_rank", "bess_gw"]]
+    gam = GamWithStorage(alpha=0.01).fit(x, d["delta"].to_numpy())
+    assert np.abs(gam.predict(x) - d["delta"]).mean() < 0.05  # delta = -X here
+    assert np.abs(gam.predict(x.assign(bess_gw=0.0))).max() < 0.01  # no storage, (almost) no impact
+
+
+def test_importance_and_conditions():
+    from pce68.model.impact_model import impact_by_condition, importance
+
+    class SignOfRank:
+        def predict(self, x):
+            return np.where(x["p0_rank"] > 0.5, -x["bess_gw"], x["bess_gw"]).astype(float)
+
+    d = build_dataset(traded(panel(gws=(0, 1, 2))), None)
+    d["delta"] = SignOfRank().predict(d)
+    bundle = {"model": SignOfRank(), "features": ["hour", "p0_rank", "bess_gw"]}
+    w = importance(bundle, d, n=1000)
+    assert w.index[0] in ("p0_rank", "bess_gw") and w["hour"] == 0
+    c = impact_by_condition(d.assign(pred_m=d["delta"]), "m", gw=2)
+    dear = c[(c["dimension"] == "hour") & (c["side"] == "dearest 10%")]
+    assert (dear["simulated"] == -2).all() and (dear["model"] == -2).all()

@@ -7,10 +7,11 @@ fundamentals (07_download_fundamentals.py), and predicts every month with
 models fitted on the others (leave one month out). Models compared:
 
     no impact                       the price does not move (benchmark)
-    rank lookup, ridge              simple models
+    rank lookup                     mean impact by the price's rank in the day
+    ridge                           regularised regression (roadmap benchmark)
+    GAM (splines)                   generalised additive model (roadmap benchmark)
     gradient boosting               trees
-    gradient boosting, weighted     trees, trading periods weigh more
-    ... + calibrated                with a factor per fleet size so that the
+    gradient boosting + calibrated  with a factor per fleet size so that the
                                     fleet's revenue matches on other months
 
 Prints three tables: price error, price error by fleet size, and the error
@@ -23,6 +24,8 @@ Writes:
     reports/impact_model_scores.csv     price error per model
     reports/impact_model_by_gw.csv      price error by fleet size
     reports/impact_model_revenue.csv    revenue per MW and year by fleet size and model
+    reports/impact_model_importance.csv what the best model leans on (permutation importance)
+    reports/impact_model_conditions.csv impact at 10 GW by hour, month and renewable share
     data/processed/impact_model.joblib  the fitted best model, its features and size factors
 """
 
@@ -42,6 +45,8 @@ from pce68.model.impact_model import (
     error_by_fleet_size,
     feature_columns,
     fit_model,
+    impact_by_condition,
+    importance,
     model_names,
     revenue_by_model,
     revenue_errors,
@@ -83,7 +88,7 @@ def main() -> None:
     reports = ROOT / "reports"
     reports.mkdir(parents=True, exist_ok=True)
 
-    table = summarise(predicted)
+    table = summarise(predicted, config["impact"]["min_abs_price"])
     log.info("Error of the predicted price with storage:\n")
     print(table.round(3).to_string())
     table.to_csv(reports / "impact_model_scores.csv")
@@ -114,6 +119,19 @@ def main() -> None:
         log.info("\nSize factors: %s", {k: round(v, 3) for k, v in bundle["factors"].items()})
     out = processed / "impact_model.joblib"
     joblib.dump(bundle, out)
+
+    # What the model leans on, and how the impact changes with market conditions.
+    weights = importance(bundle, clean)
+    weights.to_csv(reports / "impact_model_importance.csv", header=True)
+    log.info("\nWhat %s leans on: MAE increase (€/MWh) when each feature is shuffled:\n", best)
+    print(weights.round(2).to_string())
+    conditions = impact_by_condition(predicted, best)
+    conditions.to_csv(reports / "impact_model_conditions.csv", index=False)
+    by_hour = conditions[conditions["dimension"] == "hour"].pivot(
+        index="value", columns="side", values=["simulated", "model"]
+    )
+    log.info("\nMean impact (€/MWh) with %g GW by hour, unseen months:\n", conditions["GW"].iloc[0])
+    print(by_hour.round(1).rename_axis("hour").to_string(na_rep=""))
     log.info("\nBest: %s (of %d). Saved %s; tables in %s", best, len(names), out, reports)
 
 

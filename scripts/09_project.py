@@ -159,7 +159,8 @@ def main() -> None:
     log.info("\nDone in %.0f s. By scenario and year (prices and spreads in EUR/MWh):\n", time.time() - t0)
     print(summary.round(1).to_string(index=False))
     log.info("\nRevenue of 1 MW of 2 h battery (EUR/MW/yr) with X GW installed, by year:\n")
-    print(curve.pivot(index="GW", columns="year", values="revenue (EUR/MW/yr)").round(0).to_string())
+    table = curve.pivot(index="GW", columns="year", values="revenue (EUR/MW/yr)").round(0)
+    print(table.rename(index="{:g}".format).to_string())
     log.info("\nWrote projection_prices.csv, projection_summary.csv and projection_curve.csv to %s", reports)
 
 

@@ -38,13 +38,19 @@ impact:
   min_abs_price: 5
 
 fundamentals:
-  # REE ESIOS indicators to download (07_download_fundamentals.py), as column: id.
+  # REE ESIOS indicators to download (07_download_fundamentals.py), as column: id or name.
   # Starting ids from third-party lists that do not all agree: the script prints
   # each one's official name, so check them and fix any with --find "text".
   indicators:
     demand: 1293       # Demanda real
     wind: 551          # Generación T.Real eólica
     solar_pv: 1295     # Generación T.Real solar fotovoltaica
+    # By name: looked up in the ESIOS catalogue (check the names the script prints).
+    hydro: Generación T.Real hidráulica
+    nuclear: Generación T.Real nuclear
+    combined_cycle: Generación T.Real ciclo combinado
+    # Cross-border flows, gas and CO2 prices are not added: ENGIE's forecast must
+    # provide every input the model uses (stage 3), so add them only if it does.
 
 projection:
   # Stage 3: the impact model applied to a price forecast (09_project.py).
