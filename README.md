@@ -7,12 +7,20 @@ and how that value shrinks as more storage is installed (self-cannibalisation).
 
 ## Pipeline
 
+Everything, in order, ending with the Excel report (each step skips what is already done):
+
+```bash
+python scripts/run_all.py              # or `make all`; add --sample 3 for a faster first run
+```
+
+Step by step:
+
 | Step | Command (Windows: `python scripts/...`) | Output |
 |---|---|---|
 | 1. Prices | `make data` · `01_download_omie.py` | `data/processed/omie_prices.parquet` |
 | 2. Curves | `make curves` · `02_download_curves.py` (`--sample 3`, `--start`, `--check`) | `data/processed/curves/curves_YYYYMMDD.parquet` |
 | 3. Impact | `make impact` · `03_simulate_impact.py` | `data/processed/impact/YYYYMMDD.parquet` |
-| 4. Excel | `make excel` · `04_export_excel.py` (`--demo` for synthetic prices) | `reports/exploratory_analysis.xlsx` |
+| 4. Excel | `make excel` · `04_export_excel.py` (`--demo` for synthetic prices) | `reports/exploratory_analysis.xlsx`, with a Cannibalisation sheet once step 5 has run |
 | 5. Fleet | `make fleet` · `05_fleet.py` | cannibalisation table, `data/processed/fleet.csv` |
 | 6. Chart | `make plot` · `06_plot_fleet.py` | `reports/cannibalisation_curve.png` |
 
