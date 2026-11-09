@@ -122,7 +122,12 @@ def main() -> None:
         return
 
     # Raw files from an earlier download: compact them instead of fetching again.
-    for raw in sorted(raw_dir.glob("curva_pbc_*.1")) if raw_dir.exists() else []:
+    raws = sorted(raw_dir.glob("curva_pbc_*.1")) if raw_dir.exists() else []
+    if raws:
+        log.info("Compacting %d curve files already in %s (about 1-2 s each) ...", len(raws), raw_dir)
+    for n, raw in enumerate(raws, start=1):
+        if n % 20 == 0 or n == len(raws):
+            log.info("  file %d of %d", n, len(raws))
         day = pd.Timestamp(raw.name[10:18]).date()
         if not compact_path(compact_dir, day).exists():
             try:
