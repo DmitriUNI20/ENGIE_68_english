@@ -28,6 +28,11 @@ curves:
 impact:
   # Stage 1 of the BESS cannibalisation roadmap: X GW of storage on each day's curves.
   output_dir: data/processed/impact
+  # Only quarter-hourly days. Measured with `02_download_curves.py --check`: the
+  # effective curve re-clears the published price within 0.05 EUR/MWh on coupled
+  # quarter-hourly periods, but misses by ~17 EUR/MWh on the hourly files, which
+  # lack the bid-type column needed to drop rejected complex bids.
+  start: 2025-10-01
   grid_gw: [0, 1, 2, 4, 6, 8, 10, 12, 15, 17, 20]
   # The ratio pX/p0 is left empty where |p0| is below this (€/MWh): near zero it explodes.
   min_abs_price: 5
