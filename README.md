@@ -23,6 +23,7 @@ Step by step:
 | 4. Excel | `make excel` · `04_export_excel.py` (`--demo` for synthetic prices) | `reports/exploratory_analysis.xlsx`, with a Cannibalisation sheet once step 5 has run |
 | 5. Fleet | `make fleet` · `05_fleet.py` | cannibalisation table, `data/processed/fleet.csv` |
 | 6. Chart | `make plot` · `06_plot_fleet.py` | `reports/cannibalisation_curve.png` |
+| 7. Fundamentals | `make fundamentals` · `07_download_fundamentals.py` (`--find TEXT` to look up ids; needs the `ESIOS_TOKEN` environment variable) | `data/processed/fundamentals.parquet` |
 
 `make test` runs the tests. Parameters live in `config/base.yaml`.
 
@@ -32,6 +33,7 @@ Step by step:
 |---|---|
 | `config/base.yaml` | Parameters: download dates, battery (duration, efficiency, cycles), curves and fleet sizes. |
 | `src/pce68/data/omie.py` | Download and parsing of `marginalpdbc` price files (hourly and quarter-hourly, daylight-saving days, yearly zips). |
+| `src/pce68/data/esios.py` | REE ESIOS API: demand and generation by technology, peninsular, per quarter hour. |
 | `src/pce68/data/omie_curves.py` | Parsing of OMIE's aggregated curves (`curva_pbc`, every known layout), the effective curve and the compact format. |
 | `src/pce68/features/regimes.py` | Labels each period with its regime: pre_crisis, gas_crisis, iberian_exception, normalization. |
 | `src/pce68/features/metrics.py` | Daily spread and time-weighted statistics. |

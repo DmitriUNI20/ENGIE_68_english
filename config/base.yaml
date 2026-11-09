@@ -36,3 +36,12 @@ impact:
   grid_gw: [0, 1, 2, 4, 6, 8, 10, 12, 15, 17, 20]
   # The ratio pX/p0 is left empty where |p0| is below this (€/MWh): near zero it explodes.
   min_abs_price: 5
+
+fundamentals:
+  # REE ESIOS indicators to download (07_download_fundamentals.py), as column: id.
+  # Starting ids from third-party lists that do not all agree: the script prints
+  # each one's official name, so check them and fix any with --find "text".
+  indicators:
+    demand: 1293       # Demanda real
+    wind: 551          # Generación T.Real eólica
+    solar_pv: 1295     # Generación T.Real solar fotovoltaica
