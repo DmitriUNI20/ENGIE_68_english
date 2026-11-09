@@ -1,39 +1,52 @@
-"""Download the OMIE aggregated supply and demand curves.
+"""Download OMIE's aggregated curves and keep them in compact form.
 
-    uv run python scripts/02_download_curves.py              # or `make curves`
-    uv run python scripts/02_download_curves.py --check      # validate the reader
+    uv run python scripts/02_download_curves.py                # or `make curves`
+    uv run python scripts/02_download_curves.py --sample 3     # 3 days a week only
+    uv run python scripts/02_download_curves.py --start 2024-01-01
+    uv run python scripts/02_download_curves.py --check        # validate, download nothing
 
-These are the files the price impact is measured from, and the reason the
-project does not need to assume a slope. They are public with roughly a ninety
--day delay and the archive is a rolling six years, so the early part of the
-price series is already at the edge of what can still be fetched.
+A raw curva_pbc file is ~19 MB a day. Each one is parsed as it arrives and
+reduced to data/processed/curves/curves_YYYYMMDD.parquet (a few hundred KB):
+the effective curve plus each period's matched price, which is all the
+simulation reads. The raw file is not kept unless `curves.keep_raw` is set.
+Raw files already in `curves.raw_dir` (from an earlier download) are compacted
+first, so nothing has to be fetched twice.
 
-One day of curves is far heavier than one day of prices, so the default span is
-the normalization regime only -- the market being projected. Widen it with
---start if a longer counterfactual is wanted.
+Downloads run `curves.workers` at a time. Days already compacted are skipped,
+so the script can be stopped and resumed. `--sample N` keeps N days a week,
+rotating the weekday from one week to the next so every weekday and season is
+represented; the impact model does not need every day.
 
-`--check` runs the validation that decides whether the reader can be trusted:
-it re-clears the untouched historical curves and compares the result against
-the published marginalpdbc price. Gottfried and Muller report a mean error of
-0.05 EUR/MWh in 2024 from ignoring block bids and market coupling. An error of
-that order means the reader works; an error of several euros means it does not,
-and every figure downstream is then wrong.
+`--check` measures the reader before anything is built on it: it re-clears the
+effective curves of every compacted day and compares the result with the
+published Spanish price (omie_prices.parquet, from `make data`). Before
+calibration the error should be ~1-2 EUR/MWh on quarter-hourly days; several
+euros on most periods means the reader is wrong.
 """
 
 from __future__ import annotations
 
 import argparse
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, timedelta
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import requests
 import yaml
 
-from pce68.data.omie import consolidate
-from pce68.data.omie_curves import build, download, file_name, parse
-from pce68.market.curves import clear
+from pce68.data.omie_curves import (
+    ENCODING,
+    compact,
+    compact_path,
+    download_raw,
+    effective_curves,
+    file_name,
+    parse_curves,
+)
+from pce68.market.curves import reconstruction_error
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 log = logging.getLogger(__name__)
@@ -42,73 +55,112 @@ ROOT = Path(__file__).resolve().parents[1]
 TZ = "Europe/Madrid"
 
 
-def check(curves_dir: Path, raw_prices: Path) -> None:
-    """Re-clear untouched curves and compare with the published price."""
-    files = sorted(curves_dir.glob("curva_pbc_*.1"))
+def sampled(days: list[date], per_week: int) -> list[date]:
+    """Keep `per_week` days a week, shifting the weekday each week."""
+    return [d for d in days if (d.toordinal() + d.toordinal() // 7) % 7 < per_week]
+
+
+def store(text: str, day: date, compact_dir: Path, raw_dir: Path, keep_raw: bool) -> None:
+    compact(parse_curves(text)).to_parquet(compact_path(compact_dir, day), index=False)
+    if keep_raw:
+        (raw_dir / file_name(day)).write_text(text, encoding=ENCODING)
+
+
+def published_by_day(prices: pd.DataFrame) -> dict[date, np.ndarray]:
+    local = prices["timestamp_utc"].dt.tz_convert(TZ)
+    ordered = prices.assign(day=local.dt.date).sort_values("timestamp_utc")
+    return {d: g["price_es"].to_numpy() for d, g in ordered.groupby("day")}
+
+
+def check(compact_dir: Path, price_file: Path) -> None:
+    files = sorted(compact_dir.glob("curves_*.parquet"))
     if not files:
-        raise SystemExit(f"no curve files in {curves_dir}; download some first.")
+        raise SystemExit(f"no compact curves in {compact_dir}; download some first.")
+    if not price_file.exists():
+        raise SystemExit(f"{price_file} not found; run `make data` first.")
+    published = published_by_day(pd.read_parquet(price_file))
 
-    published = consolidate(raw_prices)
-    published = published.assign(
-        day=published["timestamp_utc"].dt.tz_convert(TZ).dt.date,
-        period=published.groupby(published["timestamp_utc"].dt.tz_convert(TZ).dt.date).cumcount() + 1,
-    ).set_index(["day", "period"])["price_es"]
-
-    errors = []
+    errors, skipped = [], 0
     for path in files:
-        stamp = path.stem.split("_")[-1]
-        day = date(int(stamp[:4]), int(stamp[4:6]), int(stamp[6:8]))
-        bids = parse(path.read_text(encoding="latin-1", errors="replace"))
-        for period in sorted(bids["period"].unique()):
-            key = (day, int(period))
-            if key not in published.index:
-                continue
-            try:
-                price, _ = clear(*build(bids, int(period)))
-            except ValueError:
-                continue
-            errors.append(price - float(published.loc[key]))
-
+        day = pd.Timestamp(path.stem.split("_")[-1]).date()
+        curves = effective_curves(pd.read_parquet(path))
+        prices = published.get(day)
+        if prices is None or len(prices) != len(curves):
+            skipped += 1
+            continue
+        errors.append(reconstruction_error(curves, prices))
     if not errors:
-        raise SystemExit("no period could be matched against a published price.")
+        raise SystemExit("no day could be matched against a published price.")
 
-    e = np.abs(np.array(errors))
-    log.info("\nRe-cleared %d periods against marginalpdbc", len(e))
-    log.info("  mean absolute error   %8.3f EUR/MWh   (Germany 2024: 0.05)", e.mean())
-    log.info("  99%% quantile          %8.3f EUR/MWh   (Germany 2024: 1.06)", np.quantile(e, 0.99))
-    log.info("  worst                 %8.3f EUR/MWh", e.max())
-    verdict = "the reader looks sound" if e.mean() < 0.5 else "TOO LARGE -- do not trust what follows"
-    log.info("  verdict: %s", verdict)
+    e = np.abs(np.concatenate(errors))
+    log.info("Re-cleared %d periods of %d days against marginalpdbc (%d days skipped)",
+             len(e), len(errors), skipped)  # fmt: skip
+    log.info("  mean absolute error   %8.2f EUR/MWh", e.mean())
+    log.info("  periods within 1 EUR  %8.0f %%", 100 * (e <= 1).mean())
+    log.info("  periods within 5 EUR  %8.0f %%", 100 * (e <= 5).mean())
+    log.info("  99%% quantile          %8.2f EUR/MWh", np.quantile(e, 0.99))
+    log.info("The simulation calibrates each period to the published price, so this residual")
+    log.info("only affects how the curve bends near the price, not the starting point.")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--start", default="2024-01-01", help="first day, AAAA-MM-DD")
-    parser.add_argument("--end", default=None, help="last day; default is 100 days ago")
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument("--start", help="first day, YYYY-MM-DD (default: curves.start)")
+    parser.add_argument("--end", help="last day (default: curves.end, or yesterday)")
+    parser.add_argument("--sample", type=int, choices=range(1, 8), help="days per week to keep")
     parser.add_argument("--check", action="store_true", help="validate the reader, download nothing")
     args = parser.parse_args()
 
     config = yaml.safe_load((ROOT / "config" / "base.yaml").read_text())
-    curves_dir = ROOT / config["fleet"]["curves_dir"]
-
+    cfg = config["curves"]
+    raw_dir, compact_dir = ROOT / cfg["raw_dir"], ROOT / cfg["compact_dir"]
+    compact_dir.mkdir(parents=True, exist_ok=True)
     if args.check:
-        check(curves_dir, ROOT / config["data"]["raw_dir"])
+        check(compact_dir, ROOT / config["data"]["processed_dir"] / "omie_prices.parquet")
         return
 
-    start = pd.Timestamp(args.start).date()
-    end = pd.Timestamp(args.end).date() if args.end else date.today() - timedelta(days=100)
-    days = [d.date() for d in pd.date_range(start, end, freq="D")]
+    # Raw files from an earlier download: compact them instead of fetching again.
+    for raw in sorted(raw_dir.glob("curva_pbc_*.1")) if raw_dir.exists() else []:
+        day = pd.Timestamp(raw.name[10:18]).date()
+        if not compact_path(compact_dir, day).exists():
+            try:
+                store(raw.read_text(encoding=ENCODING, errors="replace"), day, compact_dir, raw_dir, False)
+            except ValueError as e:
+                log.warning("%s: %s", raw.name, e)
+                continue
+        if not cfg.get("keep_raw", False):
+            raw.unlink()
 
-    log.info("Downloading %d days of curves (%s to %s) into %s ...", len(days), start, end, curves_dir)
-    failed = download(days, curves_dir)
-    have = sum(1 for d in days if (curves_dir / file_name(d)).exists())
-    log.info("%d of %d days present.", have, len(days))
-    if failed:
-        log.warning(
-            "%d days failed. Days more recent than the ~90-day delay are not published yet; "
-            "run again later for those.", len(failed)
-        )
-    log.info("\nNow validate the reader:  uv run python scripts/02_download_curves.py --check")
+    start = pd.Timestamp(args.start or cfg["start"]).date()
+    end_cfg = args.end or cfg.get("end")
+    end = pd.Timestamp(end_cfg).date() if end_cfg else date.today() - timedelta(days=1)
+    days = [d.date() for d in pd.date_range(start, end, freq="D")]
+    if args.sample:
+        days = sampled(days, args.sample)
+    todo = [d for d in days if not compact_path(compact_dir, d).exists()]
+    log.info("%d days wanted (%s to %s), %d already compact, %d to download with %d workers ...",
+             len(days), start, end, len(days) - len(todo), len(todo), cfg["workers"])  # fmt: skip
+    if cfg.get("keep_raw", False):
+        raw_dir.mkdir(parents=True, exist_ok=True)
+
+    failed = 0
+    with requests.Session() as s, ThreadPoolExecutor(max_workers=cfg["workers"]) as pool:
+        futures = {pool.submit(download_raw, d, s): d for d in todo}
+        for n, future in enumerate(as_completed(futures), start=1):
+            day = futures[future]
+            try:
+                store(future.result(), day, compact_dir, raw_dir, cfg.get("keep_raw", False))
+            except Exception as e:  # noqa: BLE001 - report the day and carry on
+                log.warning("%s: %s", day, e)
+                failed += 1
+            if n % 20 == 0 or n == len(todo):
+                log.info("  %d / %d days done", n, len(todo))
+
+    log.info("Finished: %d days compact in %s, %d failed (run again to retry them).",
+             len(days) - failed, compact_dir, failed)  # fmt: skip
+    log.info("Next: validate the reader with  python scripts/02_download_curves.py --check")
 
 
 if __name__ == "__main__":

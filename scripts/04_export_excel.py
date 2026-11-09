@@ -31,7 +31,7 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
 from pce68.dispatch.battery import Battery, simulate_price_taker
-from pce68.features.metrics import daily_spread
+from pce68.features.metrics import daily_spread, weighted_mean, weighted_median, weighted_std
 from pce68.features.regimes import annotate, summary
 
 logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -141,8 +141,13 @@ def main() -> None:
     prices["hour"] = local.dt.hour
     prices["hours"] = prices["resolution_min"] / 60.0
 
+    # Spread and battery use the same duration, so the two columns compare like with like.
+    dur = bat.duration_hours
+    spread_col = f"Mean {dur:g} h spread (€/MWh)"
+    revenue_col = f"{dur:g} h battery revenue (€/MW/year)"
+
     log.info("Computing daily spreads...")
-    spread2 = daily_spread(prices, 2.0).rename(columns={"spread_2h": "spread"})
+    spread2 = daily_spread(prices, dur).rename(columns={f"spread_{dur:g}h": "spread"})
     spread2["year"] = pd.to_datetime(spread2["day_local"]).dt.year
     spread2["month"] = pd.to_datetime(spread2["day_local"]).dt.to_period("M").astype(str)
 
@@ -151,13 +156,15 @@ def main() -> None:
     revenue["year"] = pd.to_datetime(revenue["day"]).dt.year
 
     # ── Annual
+    # Every statistic is weighted by period length: since 01/10/2025 there are four
+    # quarter-hour rows per hour, and an unweighted mean would count them four times.
     annual = prices.groupby("year").apply(
         lambda g: pd.Series(
             {
                 "Hours of data": g["hours"].sum(),
-                "Mean price (€/MWh)": g["price_es"].mean(),
-                "Median (€/MWh)": g["price_es"].median(),
-                "Std. dev. (€/MWh)": g["price_es"].std(),
+                "Mean price (€/MWh)": weighted_mean(g["price_es"], g["hours"]),
+                "Median (€/MWh)": weighted_median(g["price_es"], g["hours"]),
+                "Std. dev. (€/MWh)": weighted_std(g["price_es"], g["hours"]),
                 "Minimum (€/MWh)": g["price_es"].min(),
                 "Maximum (€/MWh)": g["price_es"].max(),
                 "Hours at price ≤ 0": g.loc[g["price_es"] <= 0, "hours"].sum(),
@@ -166,8 +173,8 @@ def main() -> None:
         include_groups=False,
     )
     annual["% hours at price ≤ 0"] = annual["Hours at price ≤ 0"] / annual["Hours of data"]
-    annual["Mean 2 h spread (€/MWh)"] = spread2.groupby("year")["spread"].mean()
-    annual["2 h battery revenue (€/MW/year)"] = revenue.groupby("year")["revenue_eur_per_mw"].sum()
+    annual[spread_col] = spread2.groupby("year")["spread"].mean()
+    annual[revenue_col] = revenue.groupby("year")["revenue_eur_per_mw"].sum()
     annual = annual.reset_index().rename(columns={"year": "Year"})
     annual["Year"] = annual["Year"].astype(str)
 
@@ -175,18 +182,20 @@ def main() -> None:
     monthly = prices.groupby("month").apply(
         lambda g: pd.Series(
             {
-                "Mean price (€/MWh)": g["price_es"].mean(),
+                "Mean price (€/MWh)": weighted_mean(g["price_es"], g["hours"]),
                 "Hours at price ≤ 0": g.loc[g["price_es"] <= 0, "hours"].sum(),
             }
         ),
         include_groups=False,
     )
-    monthly["Mean 2 h spread (€/MWh)"] = spread2.groupby("month")["spread"].mean()
+    monthly[spread_col] = spread2.groupby("month")["spread"].mean()
     monthly = monthly.reset_index().rename(columns={"month": "Month"})
 
     # ── Hourly profile
     profile = (
-        prices.pivot_table(index="hour", columns="year", values="price_es", aggfunc="mean")
+        prices.groupby(["hour", "year"])
+        .apply(lambda g: weighted_mean(g["price_es"], g["hours"]), include_groups=False)
+        .unstack("year")
         .reset_index()
         .rename(columns={"hour": "Hour"})
     )
@@ -225,7 +234,10 @@ def main() -> None:
         "",
         "The raw data lives in data/processed/omie_prices.parquet. The analysis and the",
         "machine-learning models read from there; Excel only gets the aggregates, which are what",
-        "a person can read. Half a million quarter-hourly rows do not fit here in any useful way.",
+        "a person can read.",
+        "",
+        "Every price statistic is weighted by period length, so the quarter-hourly market",
+        "(from 01/10/2025) and the hourly one before it count the same per hour.",
         "",
         "The figures are values computed in Python, not formulas: traceability lives in the code",
         "and in version control, not in the cells.",
@@ -261,8 +273,8 @@ def main() -> None:
             "Hours of data": "#,##0",
             "Hours at price ≤ 0": "#,##0",
             "% hours at price ≤ 0": pct,
-            "Mean 2 h spread (€/MWh)": eur,
-            "2 h battery revenue (€/MW/year)": "#,##0",
+            spread_col: eur,
+            revenue_col: "#,##0",
         },
     )
 
@@ -274,7 +286,7 @@ def main() -> None:
         ws,
         3,
         monthly,
-        {"Mean price (€/MWh)": eur, "Hours at price ≤ 0": "#,##0", "Mean 2 h spread (€/MWh)": eur},
+        {"Mean price (€/MWh)": eur, "Hours at price ≤ 0": "#,##0", spread_col: eur},
     )
     ch = LineChart()
     ch.title = "Mean price and capturable spread (€/MWh)"

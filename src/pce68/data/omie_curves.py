@@ -1,39 +1,40 @@
-"""OMIE aggregated supply and demand curves (curva_pbc files).
+"""OMIE aggregated day-ahead curves (curva_pbc files).
 
-Alongside the cleared price, OMIE publishes the curves the price came from:
-one file per day holding, for every clearing period, the bids and offers
-aggregated into price steps. They are public with roughly a ninety-day delay
-and the archive is a rolling six years, which is exactly the span this project
-covers -- what is not downloaded now is lost.
+Every day OMIE publishes curva_pbc_YYYYMMDD.1: for each clearing period, every
+bid and offer as a price step. The layout has changed over time, so columns
+are found by name, not by position. Known layouts:
 
-    curva_pbc_YYYYMMDD.1
+    to 18/03/2025     Hora;...;Tipo Oferta;Energía Compra/Venta;Precio Compra/Venta;
+                      Ofertada (O)/Casada (C);
+    from 19/03/2025   Periodo;Fecha;Pais;Unidad;Tipo Oferta;Potencia Compra/Venta;
+                      Precio Compra/Venta;Ofertada (O)/Casada (C);Tipología de Oferta;
+    from 01/10/2025   the same, with quarter-hour periods H1Q1 ... H24Q4
 
-The reader finds its columns by name rather than position, because the layout
-is not stable. Two changes are known, both from real files:
+Rows: side (C = purchase/demand, V = sale/supply), quantity, €/MWh, status
+(O = offered, C = matched) and, from 2025, bid type (S = simple, C01/C02/C04
+= complex conditions, Imp FR / Exp FR = flows with France). Spanish number
+format ("1.500,00"). Quantities are read as MW: on hourly days the old MWh
+figures are the same number, and the fleet adds MW as well.
 
-    to 18/03/2025    Hora;...;Tipo Oferta;Energia Compra/Venta;Precio ...
-    from 19/03/2025  Periodo;...;Tipo Oferta;Potencia Compra/Venta;Precio ...;
-                     Tipologia de Oferta;
+The O rows are the curves as bid; the C rows are only what was matched (in
+each period matched supply equals matched demand, so they are not a curve).
+Crossing the raw O curves misses what EUPHEMIA decides on its own, which
+complex bids are accepted and how much flows to and from France: on two real
+days of November 2026 that is off by 10-19 €/MWh. The effective curve keeps
+the offered simple bids and adds, from the matched rows, the accepted complex
+bids and the French flows, which brings it within 2 €/MWh; the rest is closed
+per period by `market.curves.calibrate`. Files without a bid-type column
+(before 19/03/2025) can only use the offered rows, and lean on calibration.
 
-Besides the renaming, the quantity changed meaning: the newer files declare
-POWER in MW, not energy in MWh. Over an hourly period the two coincide, but
-over a quarter hour 1 MW is 0.25 MWh. Clearing is unaffected, since both curves
-move together, but the battery volume added to a curve is in MWh and would be
-overstated fourfold if it were not converted. `parse` therefore returns MWh
-whatever the file declares.
-
-The exact layout has not been checked against a live file from this project, so
-the first run on real data must be validated: re-clear the untouched historical
-curves with `pce68.market.curves.clear` and compare against the published
-marginalpdbc price. Gottfried and Muller report a mean error of 0.05 EUR/MWh in
-2024 from ignoring block bids and market coupling; an error of that order means
-the reader works, an error of several euros means it does not.
+A raw file weighs ~19 MB. `compact` keeps only what the simulation needs, the
+effective curve aggregated by price plus the matched price of each period,
+which is a few hundred KB.
 """
 
 from __future__ import annotations
 
-import logging
-import time
+import io
+import re
 import unicodedata
 from datetime import date
 from pathlib import Path
@@ -41,187 +42,155 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from pce68.market.curves import Curve
+from pce68.market.curves import Curves
 
-log = logging.getLogger(__name__)
-
-URL = "https://www.omie.es/es/file-download?parents%5B0%5D=curva_pbc&filename=curva_pbc_{:%Y%m%d}.1"
+URL = "https://www.omie.es/es/file-download?parents=curva_pbc&filename=curva_pbc_{:%Y%m%d}.1"
 ENCODING = "latin-1"
 
-# Fields we need, and the fragments that identify them whatever the layout.
-# "tipo oferta" is matched in full so it cannot swallow "tipologia de oferta",
-# the column added in 2025, and "quantity" covers both the old energy column
-# and the power one that replaced it.
+# Fragments that identify each column whatever the layout. "tipo oferta" is
+# matched in full so it cannot take "tipologia de oferta".
 WANTED = {
     "period": ("periodo", "hora"),
-    "kind": ("tipo oferta",),
+    "side": ("tipo oferta",),
     "quantity": ("energ", "potencia"),
     "price": ("precio",),
-    "state": ("ofertada", "casada"),
+    "status": ("ofertada",),
+    "kind": ("tipologia",),
 }
+_PERIOD = re.compile(r"^(?:H)?(\d+)(?:Q(\d))?$")
 
 
 def file_name(day: date) -> str:
     return f"curva_pbc_{day:%Y%m%d}.1"
 
 
+def compact_path(dest: Path, day: date) -> Path:
+    return dest / f"curves_{day:%Y%m%d}.parquet"
+
+
 def _fold(text: str) -> str:
     """Lowercase without accents or padding, so field names compare reliably."""
-    stripped = unicodedata.normalize("NFKD", text)
-    return "".join(c for c in stripped if not unicodedata.combining(c)).lower().strip()
+    s = unicodedata.normalize("NFKD", text)
+    return "".join(c for c in s if not unicodedata.combining(c)).lower().strip()
 
 
-def _header_row(lines: list[str]) -> int:
-    """Index of the header line: the first one naming a price and a quantity."""
-    for i, line in enumerate(lines[:20]):
-        folded = _fold(line)
-        if "precio" in folded and ("energ" in folded or "potencia" in folded):
-            return i
-    raise ValueError("no header found; check the OMIE file layout")
+def _is_header(line: str) -> bool:
+    folded = _fold(line)
+    return "precio" in folded and ("energ" in folded or "potencia" in folded)
 
 
-def _columns(header: list[str]) -> dict[str, int]:
-    """Position of each wanted field within the header."""
-    found: dict[str, int] = {}
-    for i, field in enumerate(header):
-        folded = _fold(field)
-        if not folded:
-            continue
+def period_index(label: str) -> tuple[int, bool]:
+    """'H1Q1' -> (1, True), 'H24Q4' -> (96, True), 'H5' or '5' -> (5, False)."""
+    m = _PERIOD.match(label.strip())
+    if not m:
+        raise ValueError(f"unknown period label: {label!r}")
+    hour, quarter = int(m.group(1)), m.group(2)
+    return (hour, False) if quarter is None else ((hour - 1) * 4 + int(quarter), True)
+
+
+def _number(s: pd.Series) -> pd.Series:
+    cleaned = s.str.strip().str.replace(".", "", regex=False).str.replace(",", ".", regex=False)
+    return pd.to_numeric(cleaned, errors="coerce")
+
+
+def parse_curves(text: str) -> pd.DataFrame:
+    """One row per bid step: period, quarter_hourly, side, mw, price, status, kind."""
+    lines = text.splitlines()
+    header_at = next((i for i, ln in enumerate(lines[:20]) if _is_header(ln)), None)
+    if header_at is None:
+        raise ValueError("no header found; check the OMIE file layout")
+    cols: dict[str, int] = {}
+    for i, field in enumerate(_fold(f) for f in lines[header_at].split(";")):
         for name, fragments in WANTED.items():
-            if name not in found and any(f in folded for f in fragments):
-                found[name] = i
+            if field and name not in cols and any(f in field for f in fragments):
+                cols[name] = i
                 break
-    missing = {"period", "kind", "quantity", "price"} - found.keys()
+    missing = {"period", "side", "quantity", "price"} - cols.keys()
     if missing:
         raise ValueError(f"OMIE header is missing {sorted(missing)}")
-    return found
+
+    body = "\n".join(ln for ln in lines[header_at + 1 :] if ln.strip().strip(";"))
+    raw = (
+        pd.read_csv(io.StringIO(body), sep=";", header=None, dtype=str, keep_default_na=False)
+        if body
+        else None
+    )
+    if raw is not None:
+        raw = raw[raw[cols["period"]].str.strip().str.fullmatch(_PERIOD.pattern[1:-1])]
+    if raw is None or raw.empty:
+        raise ValueError("curva_pbc file without bids")
+
+    periods = raw[cols["period"]].map(period_index)
+    bids = pd.DataFrame(
+        {
+            "period": periods.str[0].astype(int),
+            "quarter_hourly": periods.str[1].astype(bool),
+            "side": raw[cols["side"]].str.strip().str.upper().map({"V": "supply", "C": "demand"}),
+            "mw": _number(raw[cols["quantity"]]),
+            "price": _number(raw[cols["price"]]),
+            "status": (
+                raw[cols["status"]].str.strip().str.upper().map({"O": "offered", "C": "matched"})
+                if "status" in cols
+                else "offered"
+            ),
+            "kind": raw[cols["kind"]].str.strip() if "kind" in cols else "",
+        }
+    )
+    return bids.dropna(subset=["side", "mw", "price", "status"]).reset_index(drop=True)
 
 
-def _number(text: str) -> float:
-    """Spanish number (dot thousands, comma decimals) to float."""
-    cleaned = text.strip().replace(".", "").replace(",", ".")
-    return np.nan if cleaned in ("", "-") else float(cleaned)
+def compact(bids: pd.DataFrame) -> pd.DataFrame:
+    """What the simulation needs from a parsed file, a small fraction of its size.
 
-
-def parse(text: str, offered_only: bool = True) -> pd.DataFrame:
-    """Turn a curva_pbc file into rows of period, kind, energy_mwh, price_eur_mwh.
-
-    `kind` is "C" for a bid (compra) and "V" for an offer (venta). When the file
-    marks offered and matched points apart, only the offered ones are kept:
-    those are the full curve, and the matched subset would clear at itself.
+    Rows of the effective curve aggregated by (period, side, price), plus one
+    row per period with side="matched" holding the matched price (the highest
+    matched supply price: the Iberian clearing price). `hours` is each
+    period's length.
     """
-    lines = text.splitlines()
-    start = _header_row(lines)
-    header = lines[start].split(";")
-    columns = _columns(header)
-    width = max(columns.values()) + 1
-    declares_power = "potencia" in _fold(header[columns["quantity"]])
-
-    rows: list[tuple[int, str, float, float]] = []
-    skipped = 0
-    for line in lines[start + 1 :]:
-        fields = line.split(";")
-        if len(fields) < width:
-            skipped += 1
-            continue
-        if offered_only and "state" in columns and fields[columns["state"]].strip().upper() != "O":
-            continue
-        try:
-            period = int(fields[columns["period"]].strip())
-            kind = fields[columns["kind"]].strip().upper()[:1]
-            quantity = _number(fields[columns["quantity"]])
-            price = _number(fields[columns["price"]])
-        except (ValueError, IndexError):
-            skipped += 1
-            continue
-        if kind in ("C", "V") and np.isfinite(quantity) and np.isfinite(price):
-            rows.append((period, kind, quantity, price))
-        else:
-            skipped += 1
-
-    if skipped:
-        log.debug("%d lines skipped", skipped)
-    if not rows:
-        raise ValueError("curva_pbc file without usable bids")
-    bids = pd.DataFrame(rows, columns=["period", "kind", "energy_mwh", "price_eur_mwh"])
-
-    if declares_power:
-        # MW over a period of this length is MWh. Quarter-hourly days hold 92,
-        # 96 or 100 periods; hourly ones 23, 24 or 25.
-        hours = 0.25 if bids["period"].nunique() > 50 else 1.0
-        bids["energy_mwh"] *= hours
-    return bids
-
-
-def build(bids: pd.DataFrame, period: int) -> tuple[Curve, Curve]:
-    """Cumulative (buy, sell) curves of one clearing period.
-
-    Bids arrive split into price steps. Supply accumulates from the cheapest
-    offer upwards and demand from the dearest bid downwards; both curves are
-    stored with increasing prices so they share one representation.
-    """
-    rows = bids[bids["period"] == period]
-    if rows.empty:
-        raise ValueError(f"no bids for period {period}")
-
-    built: dict[str, Curve] = {}
-    for kind, side in (("V", "sell"), ("C", "buy")):
-        lines = rows[rows["kind"] == kind]
-        if lines.empty:
-            raise ValueError(f"period {period} has no {kind} bids")
-        steps = (
-            lines.groupby("price_eur_mwh", as_index=False)["energy_mwh"]
-            .sum()
-            .sort_values("price_eur_mwh", ascending=(side == "sell"))
+    offered = bids["status"] == "offered"
+    if (bids["kind"] != "").any():
+        effective = (offered & (bids["kind"] == "S")) | (
+            (bids["status"] == "matched") & (bids["kind"] != "S")
         )
-        price = steps["price_eur_mwh"].to_numpy(float)
-        volume = np.cumsum(steps["energy_mwh"].to_numpy(float))
-        if side == "buy":
-            price, volume = price[::-1], volume[::-1]
-        built[side] = Curve(price, volume, side)
-    return built["buy"], built["sell"]
+    else:
+        effective = offered
+    curve = bids[effective].groupby(["period", "side", "price"], as_index=False)["mw"].sum()
+    matched = bids[(bids["status"] == "matched") & (bids["side"] == "supply")]
+    clearing = matched.groupby("period", as_index=False)["price"].max().assign(side="matched", mw=0.0)
+    out = pd.concat([curve, clearing], ignore_index=True)
+    hours = bids.groupby("period")["quarter_hourly"].first().map({True: 0.25, False: 1.0})
+    out["hours"] = out["period"].map(hours)
+    return out.sort_values(["period", "side", "price"], ignore_index=True)
 
 
-def download(days: list[date], dest: Path, pause_s: float = 0.2) -> list[date]:
-    """Download the curve files missing from `dest`. Returns the days that failed.
+def effective_curves(day: pd.DataFrame) -> list[Curves]:
+    """Curves per period, in time order, from a `compact` frame."""
+    curves = []
+    for _, g in day[day["side"] != "matched"].groupby("period", sort=True):
+        s, d = g[g["side"] == "supply"], g[g["side"] == "demand"]
+        curves.append(Curves(s["price"], s["mw"], d["price"], d["mw"]))
+    return curves
 
-    Mirrors `pce68.data.omie.download`, minus the yearly-zip fallback: OMIE
-    serves the curves one day at a time only.
-    """
+
+def matched_price(day: pd.DataFrame) -> np.ndarray:
+    """Matched (Iberian) price per period, from a `compact` frame. NaN where none was matched."""
+    periods = np.sort(day["period"].unique())
+    m = day[day["side"] == "matched"].set_index("period")["price"]
+    return m.reindex(periods).to_numpy(dtype=float)
+
+
+def period_hours(day: pd.DataFrame) -> np.ndarray:
+    """Length of each period in hours, from a `compact` frame."""
+    return day.groupby("period", sort=True)["hours"].first().to_numpy()
+
+
+def download_raw(day: date, session=None) -> str:
+    """Fetch one day's curva_pbc file and return its text (checked to hold bids)."""
     import requests
 
-    dest.mkdir(parents=True, exist_ok=True)
-    failed = []
-    with requests.Session() as s:
-        for day in days:
-            path = dest / file_name(day)
-            if path.exists() and path.stat().st_size > 0:
-                continue
-            try:
-                r = s.get(URL.format(day), timeout=60)
-                r.raise_for_status()
-                text = r.content.decode(ENCODING, errors="replace")
-                parse(text)  # never save an error page under a valid file name
-                path.write_text(text, encoding=ENCODING)
-                time.sleep(pause_s)
-            except Exception as e:  # noqa: BLE001 - report it and carry on with the rest
-                log.warning("%s: %s", day, e)
-                failed.append(day)
-    return failed
-
-
-def load(source: Path, days: list[date] | None = None) -> dict[tuple[date, int], tuple[Curve, Curve]]:
-    """Read curve files into the mapping `CurveImpact` expects."""
-    curves: dict[tuple[date, int], tuple[Curve, Curve]] = {}
-    for path in sorted(source.glob("curva_pbc_*.1")):
-        stamp = path.stem.split("_")[-1]
-        day = date(int(stamp[:4]), int(stamp[4:6]), int(stamp[6:8]))
-        if days is not None and day not in days:
-            continue
-        bids = parse(path.read_text(encoding=ENCODING, errors="replace"))
-        for period in sorted(bids["period"].unique()):
-            try:
-                curves[(day, int(period))] = build(bids, int(period))
-            except ValueError as e:  # noqa: PERF203 - a bad period must not lose the day
-                log.warning("%s period %s: %s", day, period, e)
-    return curves
+    get = session.get if session is not None else requests.get
+    r = get(URL.format(day), timeout=120)
+    r.raise_for_status()
+    text = r.content.decode(ENCODING, errors="replace")
+    parse_curves(text)  # an error page must not pass for a curve file
+    return text
