@@ -47,7 +47,7 @@ def published_prices(prices: pd.DataFrame | None, day: date, periods: int) -> pd
 
 
 def main() -> None:
-    config = yaml.safe_load((ROOT / "config" / "base.yaml").read_text())
+    config = yaml.safe_load((ROOT / "config" / "base.yaml").read_text(encoding="utf-8"))
     cfg, bat = config["impact"], config["battery"]
     compact_dir = ROOT / config["curves"]["compact_dir"]
     out_dir = ROOT / cfg["output_dir"]

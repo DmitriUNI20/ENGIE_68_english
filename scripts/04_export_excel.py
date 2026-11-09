@@ -433,7 +433,7 @@ def main() -> None:
     parser.add_argument("--demo", action="store_true")
     args = parser.parse_args()
 
-    config = yaml.safe_load((ROOT / "config" / "base.yaml").read_text())
+    config = yaml.safe_load((ROOT / "config" / "base.yaml").read_text(encoding="utf-8"))
     bat = Battery(
         duration_hours=config["battery"]["duration_hours"],
         round_trip_efficiency=config["battery"]["round_trip_efficiency"],
@@ -659,7 +659,8 @@ def main() -> None:
         pass
     elif all(f.exists() for f in projection):
         proj_summary, proj_curve = (pd.read_csv(f) for f in projection[:2])
-        add_projection_sheet(wb, proj_summary, proj_curve, projection[2].read_text().strip(), eur)
+        source = projection[2].read_text(encoding="utf-8").strip()
+        add_projection_sheet(wb, proj_summary, proj_curve, source, eur)
     else:
         log.info("No projection: run 09_project.py to add the Projection sheet.")
 
