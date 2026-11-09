@@ -45,10 +45,12 @@ fundamentals:
     demand: 1293       # Demanda real
     wind: 551          # Generación T.Real eólica
     solar_pv: 1295     # Generación T.Real solar fotovoltaica
-    # By name: looked up in the ESIOS catalogue (check the names the script prints).
-    hydro: Generación T.Real hidráulica
-    nuclear: Generación T.Real nuclear
-    combined_cycle: Generación T.Real ciclo combinado
+    hydro: 546         # Generación T.Real hidráulica
+    nuclear: 549       # Generación T.Real nuclear
+    # There is no peninsular-only combined cycle indicator: the national one
+    # also counts the islands' plants, a small and steady share.
+    combined_cycle: 2041   # Generación T.Real ciclo combinado nacional
+    # An indicator can also be given by its official name, looked up in the catalogue.
     # Cross-border flows, gas and CO2 prices are not added: ENGIE's forecast must
     # provide every input the model uses (stage 3), so add them only if it does.
 
