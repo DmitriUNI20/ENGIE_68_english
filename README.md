@@ -14,6 +14,7 @@ and how that value shrinks as more storage is installed (self-cannibalisation).
 | 3. Impact | `make impact` · `03_simulate_impact.py` | `data/processed/impact/YYYYMMDD.parquet` |
 | 4. Excel | `make excel` · `04_export_excel.py` (`--demo` for synthetic prices) | `reports/exploratory_analysis.xlsx` |
 | 5. Fleet | `make fleet` · `05_fleet.py` | cannibalisation table, `data/processed/fleet.csv` |
+| 6. Chart | `make plot` · `06_plot_fleet.py` | `reports/cannibalisation_curve.png` |
 
 `make test` runs the tests. Parameters live in `config/base.yaml`.
 
