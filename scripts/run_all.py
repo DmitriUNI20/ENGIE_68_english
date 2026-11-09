@@ -39,7 +39,9 @@ STEPS = [
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     parser.add_argument("--sample", type=int, choices=range(1, 8), help="curve days per week to download")
     args = parser.parse_args()
 
@@ -50,7 +52,7 @@ def main() -> None:
         t = time.time()
         result = subprocess.run([sys.executable, str(ROOT / "scripts" / script), *extra], cwd=ROOT)
         if result.returncode != 0:
-            sys.exit(f"\nStopped: step {n} ({script}) failed. Fix it and run again; finished steps are not redone.")
+            sys.exit(f"\nStopped: step {n} ({script}) failed. Fix it and run again; done steps are skipped.")
         print(f"--- done in {time.time() - t:.0f} s", flush=True)
 
     print(f"\nAll done in {(time.time() - start) / 60:.1f} min.")
